@@ -66,3 +66,89 @@ Ok, modules loaded: Main.
 Prelude Main> :main "http://cs240h.scs.stanford.edu/"
     ~~~~
 
+## The [Dreaded][DMRWiki] [Monomorphism Restriction][DMR] (DMR)
+
+* Let's say you want to cache result of super-expensive function
+
+    ~~~~ {.haskell}
+    superExpensive val = len $ veryExpensive (val :: Int)
+        where len [] = 0
+              len (x:xs) = 1 + len xs
+    cachedResult = superExpensive 5
+    ~~~~
+
+    * `cachedResult` will start as thunk, be executed once, then
+      contain value
+
+* Let's think about the types
+
+    ~~~~
+    *Main> :t superExpensive
+    superExpensive :: Num a => Int -> a
+    *Main> :t cachedResult
+    cachedResult :: Integer
+    ~~~~
+
+    * \+ and 0 are overloaded, so `superExpensive` can return any
+      `Num` you want
+    * Why don't we have `cachedResult :: (Num a) => a`?
+    * Recall context restrictions are like hidden arguments... so
+      would make `cachedResult` into a function, undermining our
+      caching goal!
+    * But how is compiler smart enough to save us here?
+
+## The DMR continued
+
+* Answer: in this case, compiler is not actually that smart
+    * Heuristic: If it looks like a function, can infer *ad hoc*
+      polymorphic types
+    * If it looks like anything else, no *ad hoc* polymorphism unless
+      explicitly declared
+    * *parametric* polymorphic types can always be inferred (no hidden
+      arguments)
+* What looks like a function?
+    * Has to bind a single symbol (`f`), rather than a pattern (`(x,
+      y)`, `(Just x)`)
+    * Has to have at least one explicit argument (`f x =` ... ok, `f
+      =` ... not)
+* How are monomorphic types inferred?
+    * If bound symbol used elsewhere in module, infer type from use
+    * If still ambiguous and type is of class `Num`, try `Integer`
+      then `Double` (this sequence can be changed with a
+      [`default` declaration][default])
+    * If still ambiguous, compilation fails
+
+## The DMR take-away message
+
+* Think of type restrictions as implicit dictionary arguments
+    * Compiler won't saddle non-function with implicit arguments
+* This code will compile
+
+    ~~~~ {.haskell}
+    -- Compiler infers: show1 :: (Show x) => x -> String
+    show1 x = show x
+    ~~~~
+
+* But neither of these will:
+
+    ~~~~ {.haskell}
+    show2 = show
+    show3 = \x -> show x
+    ~~~~
+
+    * I'd rather you heard it from me than from GHC...
+
+* Relatively easy to work around DMR
+    * Add type signatures to functions--a good idea anyway for
+      top-level bindings, and sometimes necessary for `let` bindings
+
+        ~~~~ {.haskell}
+        -- No problem, compiler knows you want ad hoc polymorphism
+        show2 :: (Show x) => x -> String
+        show2 = show
+        ~~~~
+
+[DMR]: http://www.haskell.org/onlinereport/haskell2010/haskellch4.html#x10-930004.5.5
+[DMRWiki]: http://www.haskell.org/haskellwiki/Monomorphism_restriction
+
+
