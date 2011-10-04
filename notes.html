@@ -1,0 +1,38 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+  <meta name="generator" content="pandoc" />
+  <title></title>
+</head>
+<body>
+<h1 id="basics">Basics</h1>
+<h2 id="tip-variable-names">Tip: variable names</h2>
+<ul>
+<li>Inner functions (e.g., <code>loop</code>) often have arguments related to outer function
+<ul>
+<li>It is legal to shadow bindings and re-use variable names, but the compiler will warn you</li>
+<li>Typical practice is to add <code>'</code> (prime) to the inner-function's argument</li>
+<li>Haskell accepts the <code>'</code> character in variables, except as first character</li>
+</ul></li>
+<li>Personally, I find this practice a bit error-prone
+<ul>
+<li>While learning Haskell, I repeatedly made the error of dropping primes, e.g.:</li>
+</ul>
+<pre class="haskell"><code>factorial n = loop 1 n
+    where loop acc n' | n' &gt; 1    = loop (acc * n) (n' - 1) -- bug
+                      | otherwise = acc
+</code></pre>
+<ul>
+<li>You can avoid the problem by using the longer symbol name for the outer function</li>
+</ul>
+<pre class="haskell"><code>factorial n0 = loop 1 n0
+    where loop acc n | n &gt; 1     = loop (acc * n) (n - 1)
+                     | otherwise = acc
+</code></pre>
+<ul>
+<li>Here accidentally typing &quot;<code>factorial n0 = loop 1 n</code>&quot; causes compile error</li>
+</ul></li>
+</ul>
+</body>
+</html>
