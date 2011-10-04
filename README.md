@@ -31,3 +31,38 @@
 
     * Here accidentally typing "`factorial n0 = loop 1 n`" causes
       compile error
+
+## Running `urldump`
+
+~~~~
+$ ghc --make urldump
+[1 of 1] Compiling Main             ( urldump.hs, urldump.o )
+Linking urldump ...
+$ ./urldump http://www.scs.stanford.edu/
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN"
+...
+~~~~
+
+* What if you want to run it in GHCI?
+
+    ~~~~
+$ ghci ./urldump.hs
+Prelude Main>
+    ~~~~
+
+    * No `*` before `Main` means no access to internal symbols (because
+      compiled)
+
+    ~~~~
+Prelude Main> :load *urldump.hs
+[1 of 1] Compiling Main             ( urldump.hs, interpreted )
+Ok, modules loaded: Main.
+*Main> withArgs ["http://cs240h.scs.stanford.edu/"] main
+    ~~~~
+
+    * Alternate GHCI shortcut:
+
+    ~~~~
+Prelude Main> :main "http://cs240h.scs.stanford.edu/"
+    ~~~~
+
