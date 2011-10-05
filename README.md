@@ -152,3 +152,49 @@ Prelude Main> :main "http://cs240h.scs.stanford.edu/"
 [DMRWiki]: http://www.haskell.org/haskellwiki/Monomorphism_restriction
 
 
+# Memory
+
+## `seq` revisited
+
+* Recall `seq :: a -> b -> b`
+    * If `seq a b` is forced, then first `a` is forced, then `b` is
+      forced and returned
+* Consider the following code:
+
+    ~~~~ {.haskell}
+    infiniteLoop = infiniteLoop :: Char   -- loops forever
+
+    seqTest1 = infiniteLoop `seq` "Hello" -- loops forever
+
+    seqTest2 = str `seq` length str       -- returns 6
+        where str = infiniteLoop:"Hello"
+    ~~~~
+
+    * `seqTest1` hangs forever, while `seqTest2` happily returns 6
+* `seq` only forces a `Val`, not the `arg` fields of the `Val`
+    * `seqTest2`'s `seq` forces `str`'s constructor `(:)`, but not the
+      head or tail
+    * This is known as putting `str` in *Weak Head Normal Form* (WHNF)
+    * Can't fully evaluate an arbitrary data type (but see
+      [Control.DeepSeq](http://hackage.haskell.org/packages/archive/deepseq/latest/doc/html/Control-DeepSeq.html))
+
+# Semantic effects of strictness
+
+* Strictness is primarily used for optimization
+    * To avoid building up long chains of thunks
+    * To save overhead of checking whether thunk evaluated
+* But has semantic effects:  A non-strict `Int` is not just a number
+    * Can also throw an exception or loop forever when evaluated
+    * Such behavior can be modeled as a special value $\bot$
+      ("bottom")
+    * So the values of `Int` are $\{0,1\}^{64} \cup \{\bot\}$
+    * Types that include value $\bot$ are called *lifted*
+* Note 1: an unboxed type is necessarily unlifted
+* Note 2: `!Int` not a first-class type, only valid for `data` fields
+
+    ~~~~ {.haskell}
+    data SMaybe a = SJust !a | SNothing   -- ok, data field
+    strictAdd :: !Int -> !Int -> !Int     -- error
+    type StrictMaybeInt = Maybe !Int      -- error
+    ~~~~
+
