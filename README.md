@@ -498,3 +498,243 @@ Prelude Main> :main "http://cs240h.scs.stanford.edu/"
 [bytestring]: http://www.haskell.org/ghc/docs/latest/html/libraries/bytestring-0.9.2.0/index.html
 [ByteString.Lazy]: http://www.haskell.org/ghc/docs/latest/html/libraries/bytestring-0.9.2.0/Data-ByteString-Lazy.html
 [finalizerFree]: http://www.haskell.org/ghc/docs/latest/html/libraries/base-4.4.0.0/Foreign-Marshal-Alloc.html#v:finalizerFree
+
+
+# Testing
+
+## Type defaulting - a recap
+
+Haskell's usual defaulting rules take each group of constraints `(C1 a, C2
+a, ..., Cn a)` for each type variable `a`, and defaults the type
+variable if all of the following conditions hold:
+
+* The type variable `a` appears in no other constraints.
+
+* All the classes `Ci` are standard.
+
+* At least one of the classes `Ci` is numeric.
+
+## That's not enough for us lazy programmers!
+
+To reduce the number of types we're forced to specify by hand, `ghci`
+relaxes the standard rules (changes in italics):
+
+* The type variable `a` appears in no other constraints. *Unchanged*.
+
+* All the classes `Ci` are standard, *and all are single-parameter
+  type classes*.
+
+* At least one of the classes `Ci` is numeric, *or is `Show`, `Eq`, or
+  `Ord`*.
+
+It also adds another critical step when defaulting:
+
+* The type `()` becomes the first of the the standard list of types
+  tried when doing type defaulting.
+
+## Peek inside
+
+We can use the `verboseCheck` function to see all the test data that
+QuickCheck is generating for us.
+
+~~~~ {.haskell}
+t_idempotent xs = 
+    sort (sort xs) == sort xs
+~~~~
+
+~~~~
+>> import Test.QuickCheck
+>> quickCheck t_idempotent
+>> verboseCheck t_idempotent
+~~~~
+
+Notice that we have endless lists of `()`?
+
+Our supposedly reassuring test isn't very useful!
+
+~~~~
+>> import Data.Word (Word8)
+>> verboseCheck (t_idempotent :: [Word8] -> Bool)
+~~~~
+
+## Witness the fitness
+
+Here's an alternative approach:
+
+~~~~
+t_witnessed p a xs = sortBy p (sortBy p xs) == sortBy p xs
+  where _witness = a < head xs
+~~~~
+
+What's that `_witness` variable for?
+
+* It's a *type witness*, a value that exists to express a constraint
+  between several types (it "witnesses" the constraint).
+  
+* Thanks to the use of `<`, this witness forces the type of `a` and
+  the type of the elements of `xs` to be the same.
+
+(We prefix the name with an underscore to tell GHC that it's an unused
+wild card.)
+
+## Instantiating our new polymorphic test
+
+We can supply a value for `a` of the appropriate type to test over:
+
+~~~~
+>> verboseCheck (t_witnessed compare 'a')
+~~~~
+
+Of course, the value of `a` is never used.
+
+As a result, we don't even need to supply a working value, provided the
+type of what we supply is correct:
+
+~~~~
+>> verboseCheck (t_witnessed compare (undefined::Double))
+~~~~
+
+## Where do random values come from?
+
+To generate random values of some type, we must write an `Arbitrary`
+instance for it.
+
+~~~~ {.haskell}
+class Arbitrary a where
+  arbitrary :: Gen a
+~~~~
+
+Here's an example, making use of the fact that this unknown type `Gen`
+is an instance of `Monad`:
+
+~~~~ {.haskell}
+import Control.Monad (liftM2)
+
+data Point = Point Int Int
+
+instance Arbitrary Point where
+    arbitrary = liftM2 Point arbitrary arbitrary
+~~~~
+
+## Conditional properties
+
+Suppose we want to verify that the sum of two odd integers is always
+even.
+
+It would be nice if we could express the idea "check this property
+only if the inputs satisfy these constraints".
+
+In fact, there's a combinator for that: `==>`
+
+~~~~ {.haskell}
+p_sum_odd1 a b =
+    odd a && odd b ==> 
+    even (a+b)
+~~~~
+
+This specifies that the property on the right should hold whenever the
+`Bool`-valued test on the left succeeds.
+
+QuickCheck will discard inputs for which the test fails.
+
+## Correctness by construction
+
+Instead of filtering out data that isn't right for us, it's better to
+generate *only* data that is right.
+
+~~~~
+newtype Odd a = Odd a
+    deriving (Show)
+
+instance (Integral a, Arbitrary a) => Arbitrary (Odd a) where
+    arbitrary = do
+      a <- arbitrary
+      return $! Odd (if even a then a + 1 else a)
+~~~~
+
+It's clear from inspection that the `Arbitrary` instance for `Odd a`
+will only generate odd-valued integers.
+
+# Sizing a test
+
+Test data generators have an implicit size parameter, hidden inside
+the `Gen` type.
+
+QuickCheck starts by generating small test cases; it increases the
+size as testing progresses.
+
+The meaning of "size" is specific to the needs of an `Arbitrary`
+instance.
+
+* The `Arbitrary` instance for lists interprets it as "the maximum
+  length of a list of arbitrary values".
+
+We can find the current size using the `sized` function, and modify it
+locally using `resize`:
+
+~~~~ {.haskell}
+sized  :: (Int -> Gen a) -> Gen a
+resize ::  Int -> Gen a  -> Gen a
+~~~~
+
+## Testing a recursive data type
+
+Suppose we have a tree type:
+
+~~~~ {.haskell}
+data Tree a = Node (Tree a) (Tree a)
+            | Leaf a
+              deriving (Show)
+~~~~
+
+Here's an obvious `Arbitrary` instance:
+
+~~~~ {.haskell}
+instance (Arbitrary a) => Arbitrary (Tree a) where
+    arbitrary = oneof [
+                  liftM Leaf arbitrary
+                , liftM2 Node arbitrary arbitrary
+                ]
+~~~~
+
+The `oneof` combinator chooses a generator at random.
+
+~~~~ {.haskell}
+oneof :: [Gen a] -> Gen a
+~~~~
+
+## What's up, Doc?
+
+Potential trouble:
+
+* This generator may not terminate at all!
+
+* It's likely to produce *huge* trees.
+
+We can use the `sample` function to generate and print some arbitrary
+data.
+
+~~~~ {.haskell}
+sample :: (Show a) => Gen a -> IO ()
+~~~~
+
+This helps us to explore what's going on.
+
+## A safer instance
+
+Here's where the sizing mechanism comes to the rescue.
+
+~~~~ {.haskell}
+instance (Arbitrary a) => Arbitrary (Tree a) where
+    arbitrary = sized tree
+
+tree :: (Arbitrary a) => Int -> Gen (Tree a)
+tree 0 = liftM Leaf arbitrary
+tree n = oneof [
+           liftM  Leaf arbitrary
+         , liftM2 Node subtree subtree
+         ]
+  where subtree = tree (n `div` 2)
+~~~~
+
+
