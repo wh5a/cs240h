@@ -485,6 +485,36 @@ Prelude Main> :main "http://cs240h.scs.stanford.edu/"
       (so if a library can work efficiently on lazy `ByteString`s,
       good to expose that functionality)
 
+## Exceptions in pure code
+
+* Can `throw` exceptions in pure code, yet `catch` them only in `IO`
+    * This is because evaluation order depends on implementation
+    * Which error is thrown by `(error "one") + (error "two")`?<br/>
+      Can be non-deterministic, which is [okay][imprecise exceptions]
+      if `catch` is restricted to the `IO` Monad
+* In `IO`, use `throwIO` (not `throw`) to make exception sequencing
+  precise
+
+    ~~~~ {.haskell}
+        do x <- throwIO (MyError "one")  -- this exception thrown
+           y <- throwIO (MyError "two")  -- this code not reached
+    ~~~~
+
+* Beware `catch` only catches exceptions if code actually evaluated
+
+
+    ~~~~ {.haskell}
+    pureCatcher :: a -> IO (Maybe a)
+    pureCatcher a = (a `seq` return (Just a))
+                    `catch` \(SomeException _) -> return Nothing
+    ~~~~
+
+    ~~~~
+    *Main> pureCatcher (undefined :: String)
+    Nothing
+    *Main> pureCatcher (undefined:undefined :: String)
+    Just "*** Exception: Prelude.undefined
+    ~~~~
 
 [Ptr]: http://www.haskell.org/ghc/docs/latest/html/libraries/base-4.4.0.0/Foreign-Ptr.html#t:Ptr
 [Storable]: http://www.haskell.org/ghc/docs/latest/html/libraries/base-4.4.0.0/Foreign-Storable.html#t:Storable
@@ -498,6 +528,7 @@ Prelude Main> :main "http://cs240h.scs.stanford.edu/"
 [bytestring]: http://www.haskell.org/ghc/docs/latest/html/libraries/bytestring-0.9.2.0/index.html
 [ByteString.Lazy]: http://www.haskell.org/ghc/docs/latest/html/libraries/bytestring-0.9.2.0/Data-ByteString-Lazy.html
 [finalizerFree]: http://www.haskell.org/ghc/docs/latest/html/libraries/base-4.4.0.0/Foreign-Marshal-Alloc.html#v:finalizerFree
+[imprecise exceptions]: http://research.microsoft.com/en-us/um/people/simonpj/papers/imprecise-exn.htm
 
 
 # Testing
@@ -737,4 +768,6 @@ tree n = oneof [
   where subtree = tree (n `div` 2)
 ~~~~
 
+
+# Concurrency
 
