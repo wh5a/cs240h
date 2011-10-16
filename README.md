@@ -771,3 +771,42 @@ tree n = oneof [
 
 # Concurrency
 
+## Bound vs. unbound threads
+
+* Without `-threaded`, all Haskell threads run in one OS thread
+    * Thread switch is basically just a procedure call, i.e. super-fast
+
+* `-threaded` introduces multiple OS-level threads
+    * Some Haskell threads are *bound* to a particular OS thread
+    * *Unbound* Haskell threads share (and migrate between) OS threads
+    * `unbound` haskell threads have same performance as w/o
+      `-threaded`
+
+## What good are OS threads?
+
+* If an unbound thread blocks, can block whole program
+    * Unix runtime tries to avoid blocking syscalls, but can't avoid
+      blocking for things like file system IO and paging
+    * With `-threaded`, GHC ensures `safe` FFI calls run in separate
+      OS thread
+    * `unsafe` FFI calls from unbound threads can block other threads
+* FFI functions may expect to be called from same thread
+    * E.g., foreign code using `pthread_getspecific` can get confused
+      if called from a migrated unbound thread
+* May want to override scheduler and run on particular CPU
+    * E.g., see
+      [`forkOn`](http://hackage.haskell.org/packages/archive/base/latest/doc/html/Control-Concurrent.html#v:forkOn)
+
+## Channels
+
+* [`Control.Concurrent.Chan`] provides unbounded *channels*
+    * Implemented as two `MVar`s -- for read and and write end of `Stream`
+
+    ~~~~ {.haskell}
+    data Item a = Item a (Stream a)
+    type Stream a = MVar (Item a)
+    data Chan a = Chan (MVar (Stream a)) (MVar (Stream a))
+    ~~~~
+
+![](chan.svg)
+
