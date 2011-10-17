@@ -884,6 +884,10 @@ record.)
 The following definitions correspond to those in the
 [data-lens](http://hackage.haskell.org/package/data-lens) package.
 
+NOTE: There are other alternatives, such as
+[data-accessor](http://blog.ezyang.com/2010/04/inessential-guide-to-data-accessor/)
+and [fclabels](http://blog.ezyang.com/2010/04/inessential-guide-to-fclabels/).
+
 ~~~~ {.haskell}
 newtype Lens rec fld = Lens (rec -> Store fld rec)
 ~~~~
