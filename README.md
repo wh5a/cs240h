@@ -810,3 +810,296 @@ tree n = oneof [
 
 ![](chan.svg)
 
+
+# Lenses
+
+## The frob merchant's web store
+
+Suppose we're building a web app, where we want to send frobs to
+customers of our web site.
+
+~~~~ {.haskell}
+data Customer = Customer {
+      custID :: Int
+    , custName :: String
+    , custAddress :: Address
+    }
+
+newtype Zip = Zip Int
+
+data Address = Address {
+      addrStreet :: String
+    , addrCity :: String
+    , addrState :: String
+    , addrZip :: Zip
+    }
+~~~~
+
+## Oh noes!
+
+A customer has made a mistake in entering their shipping zip code.
+They've called us up, irate that we've been unable to fulfil their
+urgent frob order.
+
+So. We need to change their zip code.
+
+Here are our desiderata:
+
+1. We want to be able to access fields within records.
+
+1. We want to be able to *compose* accesses, so that we can inspect
+   fields within records that are themselves fields of records.
+
+1. We want to be able to update fields within records.
+
+1. We want to be able to *compose* updates, so that we can modify
+   fields within records that are themselves fields of records.
+
+With Haskell's record syntax, we get #1 and #2, sort of #3 (if we
+squint), and definitely not #4.
+
+## Lenses
+
+What we want is a type that behaves something like this:
+
+~~~~ {.haskell}
+data Lens rec fld = Lens {
+      get :: rec -> fld
+    , set :: fld -> rec -> rec
+    }
+~~~~
+
+This "bundles together" a record type `rec` with a field type `fld`,
+so that we know:
+
+* how to get a field out of a record, and
+
+* how to update a field within a record.
+
+(Why the name "lens"? Because it lets us *focus* on a field within a
+record.)
+
+## What does a real lens look like?
+
+The following definitions correspond to those in the
+[data-lens](http://hackage.haskell.org/package/data-lens) package.
+
+~~~~ {.haskell}
+newtype Lens rec fld = Lens (rec -> Store fld rec)
+~~~~
+
+where
+
+~~~~ {.haskell}
+data Store fld rec = Store (fld -> rec) fld
+~~~~
+
+That's hard to follow, so let's dig in and try to understand.  First,
+we'll get rid of the name `Store`, to give the tuple:
+
+~~~~ {.haskell}
+(fld -> rec, fld)
+~~~~
+
+Then we'll substitute this into the definition of `Lens`:
+
+~~~~ {.haskell}
+newtype Lens rec fld = Lens (rec -> (fld -> rec, fld))
+~~~~
+
+That is, a `Lens` is:
+
+* A function that accepts a record type `rec` as its argument
+
+* It returns a pair
+
+* The first element is a setter: give it a field value of type `fld`,
+  and it will return a new record
+
+* The second element is the current value of the field
+
+## Why the coupling?
+
+Why does a lens give us both the value of a field and a function for
+setting a new value of that field?
+
+* Suppose that computing the path to the right place in the record for
+  the getter is expensive.
+  
+* This representation allows the setter to reuse that computation.
+
+## The get operator
+
+Here is our getter:
+
+~~~~ {.haskell}
+(^.) :: rec -> Lens rec fld -> fld
+a ^. (Lens f) = pos (f a)
+infixr 9 ^.
+
+-- internal
+pos :: Store fld rec -> fld
+pos (Store _ s) = s
+~~~~
+
+## The set operator
+
+And here is our setter:
+
+~~~~ {.haskell}
+(^=) :: Lens rec fld -> fld -> rec -> rec
+(Lens f) ^= b = peek b . f
+infixr 4 ^=
+
+-- internal
+peek :: fld -> Store fld rec -> rec
+peek s (Store g _) = g s
+~~~~
+
+## Constructing a lens
+
+Given a getter and a setter, we can build a lens:
+
+~~~~ {.haskell}
+lens :: (rec -> fld) -> (fld -> rec -> rec) -> Lens rec fld
+lens get set = Lens $ \a -> Store (\b -> set b a) (get a)
+~~~~
+
+Alternatively, we can construct a lens from an *isomorphism* between
+record and field types:
+
+~~~~ {.haskell}
+iso :: (rec -> fld) -> (fld -> rec) -> Lens rec fld
+iso f g = Lens (Store g . f)
+~~~~
+
+## A lens for points
+
+Consider our venerable `Point` type:
+
+~~~~ {.haskell}
+data Point = Point {
+      ptX :: Int
+    , ptY :: Int
+    } deriving (Show)
+~~~~
+
+We need to define two lenses for this type, one to focus on the `x`
+coordinate, and another for `y`:
+
+~~~~ {.haskell}
+x, y :: Lens Point Int
+x = lens ptX (\x pt -> pt {ptX = x})
+y = lens ptY (\y pt -> pt {ptY = y})
+~~~~
+
+## Using our lens on points
+
+The getter:
+
+~~~~ {.haskell}
+>> let pt = Point 1 1
+>> pt ^. x
+1
+~~~~
+
+The setter:
+
+~~~~ {.haskell}
+>> (x ^= 2) pt
+Point {ptX = 2, ptY = 1}
+~~~~
+
+## Function composition: not gnar enough
+
+By now, we are familiar with (and love) function composition:
+
+~~~~ {.haskell}
+(.) :: (b -> c) -> (a -> b) -> (a -> c)
+~~~~
+
+However, we can make composition more abstract:
+
+~~~~ {.haskell}
+import Prelude hiding (id, (.))
+
+class Category cat where
+  id :: cat a a
+  (.) :: cat b c -> cat a b -> cat a c
+~~~~
+
+Now we can recast function composition as just an instance of this
+more general `Category` class:
+
+~~~~ {.haskell}
+instance Category (->) where
+    id a = a
+    f . g = \x -> f (g x)
+~~~~
+
+## Category? Composition? Abstraction? Huh?
+
+We care about the `Category` class because it turns out we can compose
+lenses!
+
+~~~~ {.haskell}
+import Control.Category
+
+instance Category Lens where
+    id = Lens (Store id)
+
+    Lens f . Lens g = Lens $ \a -> case g a of
+      Store wba b -> case f b of
+	Store wcb c -> Store (wba . wcb) c
+~~~~
+
+How do we do this in practice?
+
+Just as we compose two functions to get another function, when we
+compose two lenses, we get another lens.
+
+## Composition of lenses
+
+~~~~ {.haskell}
+data Line = Line {
+      lnBeg :: Point
+    , lnEnd :: Point
+    } deriving (Show)
+
+beg, end :: Lens Line Point
+beg = lens lnBeg (\b l -> l {lnBeg = b})
+end = lens lnEnd (\e l -> l {lnEnd = e})
+~~~~
+
+Access a nested field:
+
+~~~~ {.haskell}
+>> let l = Line (Point 1 2) (Point 3 4)
+>> l ^. (x . beg)
+~~~~
+
+Modify a nested field:
+
+~~~~ {.haskell}
+>> ((y . end) ^= 7) l
+Line {lnBeg = Point {ptX = 1, ptY = 2},
+      lnEnd = Point {ptX = 3, ptY = 7}}
+~~~~
+
+## A map as a lens
+
+Lenses are not restricted to use solely with algebraic data types.
+
+They're just as applicable to container types, for instance:
+
+~~~~ {.haskell}
+import qualified Data.Map as Map
+import Data.Map (Map)
+
+mapLens :: (Ord k) => k -> Lens (Map k v) (Maybe v)
+mapLens k = Lens $ \m ->
+            let set Nothing  = Map.delete k m
+                set (Just v) = Map.insert k v m
+                get          = Map.lookup k m
+            in Store set get
+~~~~
