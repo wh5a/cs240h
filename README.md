@@ -886,7 +886,12 @@ The following definitions correspond to those in the
 
 NOTE: There are other alternatives, such as
 [data-accessor](http://blog.ezyang.com/2010/04/inessential-guide-to-data-accessor/)
-and [fclabels](http://blog.ezyang.com/2010/04/inessential-guide-to-fclabels/).
+and
+[fclabels](http://blog.ezyang.com/2010/04/inessential-guide-to-fclabels/). [Some](http://stackoverflow.com/questions/5767129/lenses-fclabels-data-accessor-which-library-for-structure-access-and-mutatio)
+[comparisons](http://www.reddit.com/r/haskell/comments/gw7hz/lenses_fclabels_dataaccessor_which_library_for/)
+are
+available. [Semantic editor combinators](http://conal.net/blog/posts/semantic-editor-combinators)
+is another approach.
 
 ~~~~ {.haskell}
 newtype Lens rec fld = Lens (rec -> Store fld rec)
