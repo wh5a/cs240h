@@ -1112,3 +1112,495 @@ mapLens k = Lens $ \m ->
                 get          = Map.lookup k m
             in Store set get
 ~~~~
+
+
+# Phantom types
+
+## Managing mutation
+
+Application writers are often faced with a question like this:
+
+* I have a big app, and parts of it need their behaviour tweaked by an
+  administrator at runtime.
+  
+There are of course many ways to address this sort of problem.
+
+Let's consider one where we use a reference to a piece of config data.
+
+Any piece of code that's executing in the `IO` monad, if it knows the
+name of the config reference, can get the current config:
+
+~~~~ {.haskell}
+curCfg <- readIORef cfgRef
+~~~~
+
+The trouble is, ill-behaved code could clearly also *modify* the
+current configuration, and leave us with a debugging nightmare.
+
+## Phantom types to the rescue!
+
+Let's create a new type of mutable reference.
+
+We use a phantom type `t` to statically track whether a piece of code
+is allowed to modify the reference or not.
+
+~~~~ {.haskell}
+import Data.IORef
+
+newtype Ref t a = Ref (IORef a)
+~~~~
+
+Remember, our use of `newtype` here means that the `Ref` type only
+exists at compile time: it imposes *no* runtime cost.
+
+Since we are using a phantom type, we don't even need values of our
+access control types:
+
+~~~~ {.haskell}
+data ReadOnly
+data ReadWrite
+~~~~
+
+We're already in a good spot!  Not only are we creating
+compiler-enforced access control, but it will have *zero* runtime
+cost.
+
+## Creating a mutable reference
+
+To create a new reference, we just have to ensure that it has the
+right type.
+
+~~~~ {.haskell}
+newRef :: a -> IO (Ref ReadWrite a)
+newRef a = Ref `fmap` newIORef a
+~~~~
+
+## Reading and writing a mutable reference
+
+Since we want to be able to read both read-only and read-write
+references, we don't need to mention the access mode when writing a
+type signature for `readRef`.
+
+~~~~ {.haskell}
+readRef :: Ref t a -> IO a
+readRef (Ref ref) = readIORef ref
+~~~~
+
+Of course, code can only write to a reference if the compiler can
+statically prove (via the type system) that it has write access.
+
+~~~~ {.haskell}
+writeRef :: Ref ReadWrite a -> a -> IO ()
+writeRef (Ref ref) v = writeIORef ref v
+~~~~
+
+## Converting a reference to read-only
+
+This function allows us to convert any kind of reference into a
+read-only reference:
+
+~~~~ {.haskell}
+readOnly :: Ref t a -> Ref ReadOnly a
+readOnly (Ref ref) = Ref ref
+~~~~
+
+In order to prevent clients from promoting a reference from read-only
+to read-write, we do *not* provide a function that goes in the
+opposite direction.
+
+We also use the familiar technique of constructor hiding at the top of
+our source file:
+
+~~~~ {.haskell}
+module Ref
+    (
+      Ref, -- export type ctor, but not value ctor
+      newRef, readOnly,
+      readRef, writeRef
+    ) where
+~~~~
+
+## Databases
+
+Love 'em or hate 'em, everybody has to deal with databases.
+
+Here are some typical functions that a low-level database library will
+provide, for clients that have to modify data concurrently:
+
+~~~~ {.haskell}
+begin    :: Connection -> IO Transaction
+commit   :: Transaction -> IO ()
+rollback :: Transaction -> IO ()
+~~~~
+
+We can create a new transaction with `begin`, finish an existing
+one with `commit`, or cancel one with `rollback`.
+
+Typically, once a transaction has been committed or rolled back,
+accessing it afterwards will result in an exception.
+
+## Shaky foundations build a shaky house
+
+Clearly, these constructs make it easy to inadvertantly write bad
+code.
+
+~~~~ {.haskell}
+oops conn = do
+  txn <- begin conn
+  throwIO (AssertionFailed "forgot to roll back!")
+  -- also forgot to commit!
+~~~~
+
+We can avoid `rollback` and `commit` forgetfulness with a suitable
+combinator:
+
+~~~~ {.haskell}
+withTxn :: Connection -> IO a -> IO a
+withTxn conn act = do
+  txn <- begin conn
+  r <- act `onException` rollback txn
+  commit txn
+  return r
+~~~~
+
+All right!  The code running in `act` never sees a `Transaction`
+value, so it can't leak a committed or rolled back transaction.
+
+## But still...
+
+We're not out of the woods yet!
+
+High-performance web apps typically use a dynamically managed pool of
+database connections.
+
+~~~~ {.haskell}
+getConn :: Pool -> IO Connection
+returnConn :: Pool -> Connection -> IO ()
+~~~~ {.haskell}
+
+It's a major bug if a database connection is not returned to the pool
+at the end of a handler.
+
+So we write a combinator to handle this for us:
+
+~~~~ {.haskell}
+withConn :: Pool -> (Connection -> IO a) -> IO a
+withConn pool act =
+  bracket (getConn pool) (returnConn pool) act
+~~~~
+
+Nice and elegant. But correct? Read on!
+
+## Connections vs transactions
+
+In a typical database API, once we enter a transaction, we don't need
+to refer to the handle we got until we either commit or roll back the
+transaction.
+
+So it was fine for us to write a transaction wrapper like this:
+
+~~~~ {.haskell}
+withTxn :: Connection -> IO a -> IO a
+~~~~
+
+On other other hand, if we're talking to a database, we definitely
+need a connection handle.
+
+~~~~ {.haskell}
+query :: Connection -> String -> IO [String]
+~~~~
+
+So we have to pass that handle into our combinator:
+
+~~~~ {.haskell}
+withConn :: Pool -> (Connection -> IO a) -> IO a
+~~~~
+
+Unfortunately, since `withConn` gives us a connection handle, we can defeat the
+intention of the combinator (sometimes accidentally).
+
+What is the type of this function?
+
+~~~~ {.haskell}
+evil pool = withConn pool return
+~~~~
+
+## Phantom types! They'll save us again!
+
+Here, we are using the `newtype` keyword to associate a phantom type
+with the `IO` monad.
+
+~~~~ {.haskell}
+newtype DB c a = DB {
+      fromDB :: IO a
+    }
+~~~~
+
+We're going to run some code in the `IO` monad, and pass around a
+little extra bit of type information at compile time.
+
+Let's create a phantom-typed wrapper for our earlier `Connection`
+type:
+
+~~~~ {.haskell}
+newtype SafeConn c = Safe Connection
+~~~~
+
+Where are these phantom types taking us?
+
+## Safe querying
+
+The easiest place to start to understand with a little use of our new
+code, in the form of a function we'll export to clients.
+
+This is just a wrapper around the `query` function we saw earlier,
+making sure that our `newtype` machinery is in the right places to
+keep the type checker happy.
+
+~~~~ {.haskell}
+safeQuery :: SafeConn c -> String -> DB c [String]
+safeQuery (Safe conn) str = DB (query conn str)
+~~~~
+
+Notice that our phantom type `c` is mentioned in both our uses of
+`SafeConn c` and `DB c`: we're treating it as a token that we have to
+pass around.
+
+Our library will *not* be exporting the value constructors for
+`SafeConn` or `DB` to clients.  Once again, this `newtype` machinery
+is internal to us!
+
+## Giving a client a connection from a pool
+
+Here, we'll use our earlier exception-safe `withConn` combinator.
+Recall its type:
+
+~~~~ {.haskell}
+withConn :: Pool -> (Connection -> IO a) -> IO a
+~~~~
+
+To make it useful in our new setting, we have to wrap the
+`Connection`, and unwrap the `DB c` that is our `act` to get an action
+in the `IO` monad.
+
+~~~~ {.haskell}
+withSafeConn pool act =
+  withConn pool $ \conn ->
+    fromDB (act (Safe conn))
+~~~~
+
+It's not at all obvious what this is doing for us until we see the
+type of `withSafeConn`.
+
+## Scariness
+
+Here's a burly type for you:
+
+~~~~ {.haskell}
+{-# LANGUAGE Rank2Types #-}
+
+withConnection :: Pool
+               -> (forall c. SafeConn c -> DB c a) 
+               -> IO a
+~~~~
+
+We've introduced a universal quantifier (that `forall`) into our type
+signature.  And we've added a `LANGUAGE` pragma!  Whoa!
+
+Relax!  Let's not worry about those details just yet.  What does our
+signature seem to want to tell us?
+
+* We accept a `Pool`.
+
+* And an "I have a connection, so I can talk to the database now"
+  action that accepts a `SafeConn c`, returning a value `a` in the
+  world of `DB c`.
+
+Not so scary after all, except for the detail we're ignoring.
+
+## Universal quantification to the rescue!
+
+Let's start with the obviously bothersome part of the type signature.
+
+~~~~ {.haskell}
+(forall c. SafeConn c -> DB c a)
+~~~~
+
+This is the same universal quantification we've seen before, meaning:
+
+* Our "I can haz connection" action must work *over all types* `c`.
+
+* The *scope* of `c` extends only to the rightmost parenthesis here.
+
+Putting it back into context:
+
+~~~~ {.haskell}
+withConnection :: Pool
+               -> (forall c. SafeConn c -> DB c a) 
+               -> IO a
+~~~~
+
+The type variable `a` is mentioned in a place where `c` is *not* in
+scope, so although `a` is also universally quantified, it *cannot be
+related* to `c`.
+
+## Wait, wait. What, exactly, got rescued?
+
+~~~~ {.haskell}
+withConnection :: Pool
+               -> (forall c. SafeConn c -> DB c a) 
+               -> IO a
+~~~~
+
+Because `SafeConn c` shares the same phantom type as `DB c`, and the
+quantified `c` type cannot escape to the outer `IO`, there is no way
+for a `SafeConn c` *value* to escape, either!
+
+In other words, we have ensured that a user of `withConnection` cannot
+either accidentally allow or force a connection to escape from the
+place where we've deemed them legal to use.
+
+
+# Random numbers
+
+## Purely functional random numbers
+
+Haskell supplies a `random` package that we can use in a purely
+functional setting.
+
+~~~~ {.haskell}
+class Random a where
+    random :: RandomGen g => g -> (a, g)
+
+class RandomGen g where
+    next   :: g -> (Int, g)
+    split  :: g -> (g, g)
+~~~~
+
+## RandomGen
+
+The `RandomGen` class is a building block: it specifies an interface
+for a generator that can generate uniformly distributed pseudo-random
+`Int`s.
+
+There is one default instance of this class:
+
+~~~~ {.haskell}
+data StdGen {- opaque -}
+
+instance RandomGen StdGen
+~~~~
+
+## Random
+
+The `Random` class specifies how to generate a pseudo-random value of
+some type, given the random numbers generated by a `Gen` instance.
+
+Quite a few common types have `Random` instances.
+
+* For `Int`, the instance will generate any representable value.
+
+* For `Double`, the instance will generate a value in the range
+  $[0,1]$.
+  
+## Generators are pure
+
+Since we want to use a PRNG in pure code, we obviously can't modify
+the state of a PRNG when we generate a new value.
+
+This is why `next` and `random` return a *new* state for the PRNG
+every time we generate a new pseudo-random value.
+
+## Throwing darts at the board
+
+Here's how we can generate a guess at $x^2 + y^2$:
+
+~~~~ {.haskell}
+guess :: (RandomGen g) => (Double,g) -> (Double,g)
+guess (_,g) = (z, g'')
+    where z        = x^2 + y^2
+          (x, g')  = random g
+          (y, g'') = random g'
+~~~~
+
+Note that we have to hand back the *final* state of the PRNG along
+with our result! 
+
+If we handed back `g` or `g'` instead, our numbers would either be all
+identical or disastrously correlated (every `x` would just be a repeat
+of the previous `y`).
+
+## Global state
+
+We can use the `getStdGen` function to get a handy global PRNG state:
+
+~~~~ {.haskell}
+getStdGen :: IO StdGen
+~~~~
+
+This does *not* modify the state, though. If we use `getStdGen` twice
+in succession, we'll get the same result each time.
+
+To be safe, we should update the global PRNG state with the final PRNG
+state returned by our pure code:
+
+~~~~ {.haskell}
+setStdGen :: StdGen -> IO ()
+~~~~
+
+# Ugh - let's split!
+
+Calling `getStdGen` and `setStdGen` from `ghci` is a pain, so let's
+write a combinator to help us.
+
+Remember that `split` method from earlier?
+
+~~~~ {.haskell}
+class RandomGen g where
+    split  :: g -> (g, g)
+~~~~
+
+This "forks" the PRNG, creating two children with different states.
+
+The hope is that the states will be different enough that
+pseudo-random values generated from each will not be obviously
+correlated.
+
+~~~~ {.haskell}
+withGen :: (StdGen -> a) -> IO a
+withGen f = do
+  g <- getStdGen
+  let (g',g'') = split g
+  setStdGen g'
+  return (f g'')
+~~~~
+
+## Living in ghci
+
+Now we can use our `guess` function reasonably easily.
+
+~~~~ {.haskell}
+>> let f = fst `fmap` withGen (guess . ((,) undefined))
+>> f
+1.2397265526054513
+>> f
+0.9506331164887969
+~~~~
+
+## Let's iterate
+
+Here's a useful function from the `Prelude`:
+
+~~~~ {.haskell}
+iterate :: (a -> a) -> a -> [a]
+iterate f x = x : iterate f (f x)
+~~~~
+
+Obviously that list is infinite.
+
+Let's use `iterate` and `guess`, and as much other `Prelude` machinery
+as we can think of, to write a function that can approximate $\pi$.
+
+By the way, in case you don't recognize this technique, it's a famous
+example of the family of
+[Monte Carlo methods](http://en.wikipedia.org/wiki/Monte_Carlo_method).
