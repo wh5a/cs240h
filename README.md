@@ -1604,3 +1604,392 @@ as we can think of, to write a function that can approximate $\pi$.
 By the way, in case you don't recognize this technique, it's a famous
 example of the family of
 [Monte Carlo methods](http://en.wikipedia.org/wiki/Monte_Carlo_method).
+
+
+# Iteratee
+
+## Simple programming task: count lines
+
+* Here's a Unix command to count lines in include files
+
+    ~~~~
+    find /usr/include -type f -print | xargs cat | wc -l
+    ~~~~
+
+* Let's implement the same thing in Haskell
+    * Examples will require the following imports
+
+        ~~~~ {.haskell}
+        import Control.Exception
+        import Control.Monad
+        import qualified Data.ByteString.Strict as S
+        import qualified Data.ByteString.Lazy as L
+        import qualified Data.ByteString.Lazy.Char8 as L8
+        import System.FilePath
+        import System.Posix
+        import System.IO.Unsafe    -- for understanding, not recommended
+        ~~~~
+
+## Solution overview
+
+* We need a function to lists all files under a directory recursively
+
+    ~~~~ {.haskell}
+    recDir :: FilePath -> IO [FilePath]
+    ~~~~
+
+    * We'll consider how to implement this function shortly
+
+* We need a function to read the contents of a list of files
+
+    ~~~~ {.haskell}
+    readFiles :: [FilePath] -> IO L.ByteString
+    readFiles [] = return L.empty
+    readFiles (f:fs) = liftM2 L.append (L.readFile f)
+                       (readFiles fs)
+    ~~~~
+
+* Can count newlines with `Data.ByteString.Lazy.count`
+    * Actually use `.Char8` version to truncate `'\n'` to a `Word8`
+
+    ~~~~ {.haskell}
+    countLines :: FilePath -> IO ()
+    countLines dir =
+        recDir dir >>= readFiles >>= print . L8.count '\n'
+    ~~~~
+
+## Let's try this:
+
+~~~~
+*Main> countLines "/etc/rc.d"
+4979
+*Main> countLines "/usr/include"
+*** Exception: /usr/include/dovecot/master-service-settings.h: 
+openBinaryFile: resource exhausted (Too many open files)
+~~~~
+
+* Oops, what happened?  Let's investigate with using
+  [`lsof`](http://people.freebsd.org/~abe/) utility
+
+    ~~~~
+    *Main> x <- readFiles ["/etc/motd", "/etc/resolv.conf"]
+    *Main> :!lsof -c ghc
+    ...
+    ghc   4008   dm   7r   REG  8,3     0 2752575 /etc/motd
+    ghc   4008   dm   8r   REG  8,3   152 2752562 /etc/resolv.conf
+    *Main> L.length x
+    152
+    *Main> :!lsof -c ghc
+    [gone]
+    ~~~~
+
+    * Lazy I/O in `L.readFile` causes files to be opened but not read
+    * `L.length`, a supposedly pure function, causes files to be read
+      and closed!
+    * If we call `L.readFile` a lot without forcing I/O, run out of
+      file descriptors
+
+* One fix: delay file opens with `unsafeInterleaveIO`
+
+    ~~~~ {.haskell}
+    readFiles :: [FilePath] -> IO L.ByteString
+    readFiles [] = return L.empty
+    readFiles (f:fs) = liftM2 L.append (L.readFile f)
+                       (unsafeInterleaveIO $ readFiles fs)
+    ~~~~
+
+    * Now doesn't open next file until previous one closed
+
+        ~~~~
+        *Main> x <- recDir "/etc/rc.d" >>= readFiles
+        *Main> :!lsof -c ghc
+        ... 
+        ghc  10180   dm   8r   REG  8,3   894 2754867 /etc/rc.d/healthd
+        *Main> L.index x 10000
+        62
+        *Main> :!lsof -c ghc
+        ...
+        ghc  10180   dm   8r   REG  8,3   779 2753245 /etc/rc.d/sshd
+        ~~~~
+
+## The iteratee abstraction [[Kiselyov]](http://okmij.org/ftp/Streams.html#iteratee)
+
+* Let's introduce some terminology
+    * We call a data source such as `cat` an **enumerator**
+    * A data sink such as `wc` is an **iteratee**
+    * Idea: enumerator *iterates* over data by folding data through
+      the iteratee
+* Iteratee concept introduced by
+  [[Kiselyov]](http://okmij.org/ftp/Streams.html#iteratee)
+* Currently three implementations of the ideas on hackage
+    * [iterIO](http://hackage.haskell.org/package/iterIO) - newest
+      implementation, written by me, easiest to learn/use
+    * [enumerator](http://hackage.haskell.org/package/enumerator) -
+      second implementation, possibly most widely used
+    * [iteratee](http://hackage.haskell.org/package/iteratee) - oldest
+      implementation, fastest, hardest to understand
+* Today's lecture patterned after
+  [iterIO](http://hackage.haskell.org/package/iterIO)
+    * However, we'll build things up from scratch
+    * Code here: <http://cs240h.scs.stanford.edu/notes/miniIter.hs>
+
+## Representing iteratees
+
+* Let's think about pipeline stage `wc` in command `cat file | wc -l`?
+* It consumes input, takes actions that are a function of the input
+    * If input is not EOF, goes back and consumes more input
+    * On EOF, causes I/O side-effects (writes line to stdout)
+    * Finally returns an exit value
+    * Could also conceivably fail
+* Coding Haskell equivalent:
+
+    ~~~~ {.haskell}
+    data Chunk = Chunk { chunkData :: !L.ByteString
+                       , chunkAtEOF :: !Bool } deriving (Show)
+
+    newtype Iter a = Iter { runIter :: Chunk -> Result a }
+
+    data Result a = Done { rResult :: a, rResidual :: Chunk }
+                  | NeedInput !(Iter a)
+                  | NeedIO !(IO (Result a))
+                  | Failed !SomeException
+    ~~~~
+
+## Example: Reading a line of input
+
+~~~~ {.haskell}
+readLine :: Iter (Maybe L.ByteString)
+readLine = Iter (go L.empty)
+    where go acc (Chunk input eof)
+              | not (L.null b) = Done (Just acca) (Chunk btail eof)
+              | not eof        = NeedInput (Iter (go acca))
+              | otherwise      = Done Nothing (Chunk acca eof)
+              where (a, b) = L8.break (== '\n') input
+                    acca = L.append acc a
+                    btail = L.tail b
+~~~~
+
+* `readLine` returns `Just` next input line, or `Nothing` if no more
+  `'\n'`
+    * Processes input one `Chunk` at a time
+    * `L8.break (== '\n')` splits input at first newline (if any)
+    * `acc :: L.ByteString` keeps accumulating input while no `'\n'`
+      found
+
+## Enumerators
+
+* An enumerator feeds data to an iteratee to get a result
+
+    ~~~~ {.haskell}
+    type Enumerator a = Iter a -> IO (Result a)
+    ~~~~
+
+    * Or with Rank2Types might use `forall a. Iter a -> IO (Result a)`
+
+* For example, could feed the contents of a file like this:
+
+    ~~~~ {.haskell}
+    enumerateFile :: FilePath -> Enumerator a
+    enumerateFile path iter0 =
+        bracket (openFile path ReadMode) hClose $ \h ->
+        let go iter = do
+              input <- S.hGetSome h 32752
+              if S.null input
+                then return (NeedInput iter)
+                else check $ runIter iter $
+                     Chunk (L.fromChunks [input]) False
+            check (NeedInput iter) = go iter
+            check (NeedIO iter)    = iter >>= check
+            check result           = return result
+        in go iter0
+    ~~~~
+
+    * Leave `chunkAtEOF` `False` to keep possibility of concatenating
+      files
+
+## Make `Iter` into a `Monad`!
+
+~~~~ {.haskell}
+instance Monad Iter where
+    return a = Iter $ Done a
+    m >>= k = Iter $ \c -> check (runIter m c)
+        where check (Done a c)     = runIter (k a) c
+              check (NeedInput m') = NeedInput (m' >>= k)
+              check (NeedIO io)    = NeedIO (liftM check io)
+              check (Failed e)     = Failed e
+    fail msg = iterThrow (ErrorCall msg)
+
+instance MonadIO Iter where
+    liftIO io = Iter $ \c -> NeedIO $ try io >>= mkResult c
+        where mkResult _ (Left e)  = return (Failed e)
+              mkResult c (Right a) = return (Done a c)
+
+iterThrow :: (Exception e) => e -> Iter a
+iterThrow e = Iter $ \_ -> Failed (toException e)
+~~~~
+
+* Each `Iter` action consumes some input and returns a result
+
+* Monads let us completely hide the details of residual input!
+
+    ~~~~ {.haskell}
+    nlines1 :: Iter Int
+    nlines1 = go 0
+        where go n = readLine >>= check n
+              check n (Just _) = go $! n + 1
+              check n Nothing  = return n
+    ~~~~
+
+    ~~~~
+    *Main> enumerateFile "/etc/resolv.conf" nlines1 >>= getResult0
+    4
+    ~~~~
+
+## Inner pipeline stages
+
+* Unix pipelines can consist of more than two stages
+
+    ~~~~
+    find /usr/include -type f -print | xargs cat | wc -l
+    ~~~~
+
+    * `xargs cat` takes filenames as input and produces contents as
+      output
+
+    * So it's both an iteratee and an enumerator.  Call it an `Inum`:
+
+    ~~~~ {.haskell}
+    type Inum a = Iter a -> Iter (Result a)
+    ~~~~
+
+* Let's get rid of `Enumerator` as `Inum` is more general
+
+    * For example, an `Inum` that enumerates a file is just an `Iter`
+      that happens to consume no input:
+
+    ~~~~ {.haskell}
+    inumFile0 :: FilePath -> Inum a
+    inumFile0 path iter = liftIO $ enumerateFile path iter
+    ~~~~
+
+## `Inum` examples
+
+* cat
+
+    ~~~~ {.haskell}
+    cat :: Inum a -> Inum a -> Inum a
+    cat a b iter = a iter >>= check
+        where check (NeedInput iter') = b iter'
+              check (NeedIO io)       = liftIO io >>= check
+              check r                 = return r
+    ~~~~
+
+    * (Actually works for `Enumerator`s too if we get rid of type
+      signature)
+
+
+* Example:  an `Inum` that acts like `xargs cat` command
+
+    ~~~~ {.haskell}
+    xargsCat :: Inum a
+    xargsCat iter = do
+      mpath <- readLine
+      case mpath of
+        Nothing   -> return (NeedInput iter)
+        Just path -> inumFile (L8.unpack path) `cat` xargsCat $ iter
+    ~~~~
+
+    * Because `nextFile` is an `Iter`, it can consume input
+    * But it also generates output that it feeds to an `Iter`
+
+## Building pipelines
+
+* getResult
+
+    ~~~~ {.haskell}
+    getResult :: (MonadIO m) => Result a -> m a
+    getResult (Done a _)           = return a
+    getResult (NeedInput (Iter f)) = getResult (f chunkEOF)
+    getResult (NeedIO io)          = liftIO io >>= getResult
+    getResult (Failed e)           = liftIO $ throwIO e
+    ~~~~
+
+* Now let's define a pipe operator to hook pipeline stages together
+
+    ~~~~ {.haskell}
+    (.|) :: Inum a -> Iter a -> Iter a
+    (.|) inum iter = inum iter >>= getResult
+    infixr 4 .|
+    ~~~~
+
+* And a function to let us run an `Iter` in any `MonadIO` monad
+
+    ~~~~ {.haskell}
+    run :: (MonadIO m) => Iter a -> m a
+    run = getResult . NeedInput
+    ~~~~
+
+* Wow this is starting to look more like command pipelines!
+
+    ~~~~
+    *Main> run $ inumFile "/etc/mtab" .| countLines1
+    12
+    ~~~~
+
+## Exception handling
+
+* Let's write exception functions analogous to standard `IO` ones
+
+~~~~ {.haskell}
+iterCatch :: Iter a -> (SomeException -> Iter a) -> Iter a
+iterCatch (Iter f0) handler = Iter (check . f0)
+    where check (NeedInput (Iter f)) = NeedInput (Iter (check . f))
+          check (NeedIO io)          = NeedIO (liftM check io)
+          check (Failed e)           = NeedInput (handler e)
+          check done                 = done
+
+onFailed :: Iter a -> Iter b -> Iter a
+onFailed iter cleanup = iter `iterCatch` \e -> cleanup >> iterThrow e
+
+iterBracket :: Iter a -> (a -> Iter b) -> (a -> Iter c) -> Iter c
+iterBracket before after action = do
+  a <- before
+  b <- action a `onFailed` after a
+  after a
+  return b
+
+inumBracket :: Iter a -> (a -> Iter b) -> (a -> Inum c) -> Inum c
+inumBracket before after inum iter =
+    iterBracket before after (flip inum iter)
+~~~~
+
+## Simplifying `Inum` construction
+
+* `Inum`s still hard to write... why not build them from `Iter`s?
+    * Introduce a `Codec` which returns data and an optional next
+      'Inum'
+
+    ~~~~ {.haskell}
+    type Codec a = Iter (L.ByteString, Maybe (Inum a))
+
+    inumPure :: L.ByteString -> Inum a
+    inumPure buf (Iter f) = return (f (Chunk buf False))
+
+    runCodec :: Codec a -> Inum a
+    runCodec codec iter = do
+      (input, mNext) <- codec
+      maybe (inumPure input) (inumPure input `cat`) mNext $ iter
+    ~~~~
+
+* Example:
+
+    ~~~~ {.haskell}
+    inumFile  :: FilePath -> Inum a
+    inumFile path = inumBracket (liftIO $ openFile path ReadMode)
+                    (liftIO . hClose) $ \h ->
+        let inum = runCodec $ do
+              input <- liftIO $ S.hGetSome h 32752
+              let next = if S.null input then Nothing else Just inum
+              return (L.fromChunks [input], next)
+        in inum
+    ~~~~
