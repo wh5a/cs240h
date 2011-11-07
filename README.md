@@ -1993,3 +1993,266 @@ inumBracket before after inum iter =
               return (L.fromChunks [input], next)
         in inum
     ~~~~
+
+
+# Parsing and continuations
+
+## Parsec and attoparsec
+
+How do the two differ?
+
+* It's optimized for fast stream and file parsing, so it works with
+  the `ByteString` type.  Parsec is more general: it can parse
+  `String` or `Text`, or other more exotic token types.
+
+* attoparsec does not attempt to give friendly error messages (no file
+  names or line numbers).  Parsec might be a better choice for
+  e.g. parsing source files, where the friendliness/performance
+  tradeoff is a little different.
+
+## Getting started with attoparsec
+
+All of our examples will assume this language extension:
+
+~~~~ {.haskell}
+{-# LANGUAGE OverloadedStrings #-}
+~~~~
+
+This extension generalizes the type of quoted string constants:
+
+~~~~ {.haskell}
+>> :set -XOverloadedStrings
+>> import Data.String
+>> :type "foo"
+"foo" :: IsString a => a
+~~~~
+
+With `OverloadedStrings` enabled, we can write a string literal of
+any of the common string-like types:
+
+~~~~ {.haskell}
+>> import Data.ByteString.Char8
+>> :info IsString
+class IsString a where
+    fromString :: String -> a
+instance IsString [Char]
+instance IsString ByteString
+~~~~
+
+## Parsing a request line
+
+What does an HTTP request line consist of?
+
+~~~~
+GET /foo HTTP/1.1
+~~~~
+
+As a data type:
+
+~~~~ {.haskell}
+import Data.ByteString (ByteString)
+
+data Request = Request {
+      requestMethod  :: ByteString
+    , requestUri     :: ByteString
+    , requestVersion :: ByteString
+    } deriving (Eq, Ord, Show)
+~~~~
+
+## A word about imports
+
+With functions that deal in `ByteString` values, you'll often see
+imports like these:
+
+~~~~ {.haskell}
+import qualified Data.Attoparsec as P
+import qualified Data.Attoparsec.Char8 as P8
+
+import qualified Data.ByteString as B
+import qualified Data.ByteString.Char8 as B8
+~~~~
+
+The reason for this is that we'll often have two versions of a
+function, one specialized for `Word8` (a byte) and another for "let's
+cheat, and pretend this `Word8` is really a `Char`":
+
+~~~~ {.haskell}
+B.count  :: Word8 -> ByteString -> Int
+B8.count :: Char  -> ByteString -> Int
+~~~~
+
+Of course cheating is unsafe.  Let's see when we can get away with it.
+
+## Bytes, characters, and cheating
+
+If you're using the `ByteString` type, you *must* know when it's
+reasonably tolerable to cheat and pretend that `Word8` is `Char`.
+
+* For a protocol such as HTTP 1.1 where the headers are pretty much
+  always 7-bit ASCII text, it's generally okay.
+  
+* Even so, many of these protocols (including HTTP 1.1) have
+  exceptions, so you *still* have to be careful.
+
+* Otherwise, you should either always work with `Word8`, or use a more
+  appropriate type such as
+  [`Text`](http://hackage.haskell.org/package/text) or `String`.
+
+## HTTP Accept header
+
+~~~~
+Accept         = "Accept" ":"
+		 #( media-range [ accept-params ] )
+media-range    = ( "*/*"
+		 | ( type "/" "*" )
+		 | ( type "/" subtype )
+		 ) *( ";" parameter )
+type           = token
+subtype        = token
+accept-params  = ";" "q" "=" qvalue *( accept-extension )
+accept-extension = ";" token [ "=" ( token | quoted-string ) ]
+~~~~
+
+And here are a couple of simple and more complex examples:
+
+~~~~
+Accept: audio/*; q=0.2, audio/basic
+
+Accept: text/plain; q=0.5, text/html,
+	text/x-dvi; q=0.8, text/x-c
+~~~~
+
+## What is this I don't even
+
+Let's play around in `ghci` again.
+
+~~~~ {.haskell}
+>> :type P.parse
+P.parse :: Parser a -> ByteString -> Result a
+>> P.parse responseLine "HTTP/1.1"
+Partial _
+~~~~
+
+What's that `Result` type?
+
+## It's all about results
+
+There are many applications where we are fed partial pieces of input,
+and can produce a final parse only when we've been given enough input.
+
+* Common case: a TCP connection where we're receiving small segments
+  of input at a time, fragmented on unknown boundaries.
+
+~~~~ {.haskell}
+data Result r = Fail ByteString [String] String
+              | Partial (ByteString -> Result r)
+              | Done ByteString r
+
+instance Functor Result
+instance Show r => Show (Result r)
+~~~~
+
+The `Partial` constructor captures that behaviour.
+
+* It contains a *function* that indicates that we cannot give an
+  answer until the function is fed more input.
+  
+* We can start feeding the parser input as soon as we have some, and
+  if it doesn't return `Fail` or `Done`, we can "refill" it once more
+  input arrives.
+
+* Completely separates the concern of parsing from those of connection
+  management, buffering (not needed at all), timeouts, and the like.
+
+## Behind the scenes
+
+attoparsec achieves this magical-seeming behaviour by being built
+entirely (and invisibly!) using *continuations*.
+
+At any time, there are two continuations in play:
+
+~~~~ {.haskell}
+-- What to do if the current parse fails.
+type Failure   r = Input -> Added -> More -> [String] -> String 
+                -> Result r
+-- The Strings above are for reporting an error message.
+
+-- What to do if the current parse succeeds.
+type Success a r = Input -> Added -> More -> a 
+                -> Result r
+~~~~
+
+What are those other types that they refer to?
+
+~~~~ {.haskell}
+-- The current input.
+newtype Input = I {unI :: B.ByteString}
+
+-- Input that was fed to us when we returned a Partial result.
+newtype Added = A {unA :: B.ByteString}
+
+-- Have we reached the end of all input?
+data More = Complete | Incomplete
+            deriving (Eq, Show)
+~~~~
+
+## What's in a parser
+
+The scoped type parameter `r` represents "the rest of the parse".
+
+Remember that a scoped type variable effectively lets the callee of a
+function decide what the concrete type to be used is.
+
+Here, we've scoped `r` because we want attoparsec (and not its
+callers) to decide what the concrete type of the continuation is.
+
+~~~~ {.haskell}
+{-# LANGUAGE Rank2Types #-}
+
+newtype Parser a = Parser {
+      runParser :: forall r. Input -> Added -> More
+                -> Failure   r
+                -> Success a r
+                -> Result r
+    }
+~~~~
+
+## Games coders play
+
+The implementation of `fmap` is simple, and representative of the
+low-level internals of attoparsec.
+
+~~~~ {.haskell}
+fmap :: (a -> b) -> Parser a -> Parser b
+fmap f m = Parser $ \i0 a0 m0 kf ks ->
+           let ks' i1 a1 m1 a = ks i1 a1 m1 (f a)
+           in  runParser m i0 a0 m0 kf ks'
+~~~~
+
+Throughout the library, much of the code simply replaces either the
+failure or the success continuation with a different one.
+
+The case above looks a little daunting, but all we've done is replace
+the success continuation.  The rest is just plumbing.
+
+## Running and ending a parse
+
+As is usually the case with monads, the user-visible "run this monad"
+function is quite simple.
+
+~~~~ {.haskell}
+parse :: Parser a -> B.ByteString -> Result a
+parse m s = runParser m (I s) (A B.empty) Incomplete failK successK
+~~~~
+
+The only slight complication is that we need to create "terminal
+continuations", i.e. continuations that do not chain up yet another
+continuation, but instead return us to our usual mode of computation.
+
+~~~~ {.haskell}
+failK :: Failure a
+failK i0 _a0 _m0 stack msg = Fail (unI i0) stack msg
+
+successK :: Success a a
+successK i0 _a0 _m0 a = Done (unI i0) a
+~~~~
