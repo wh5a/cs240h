@@ -2256,3 +2256,447 @@ failK i0 _a0 _m0 stack msg = Fail (unI i0) stack msg
 successK :: Success a a
 successK i0 _a0 _m0 a = Done (unI i0) a
 ~~~~
+
+
+# Performance
+
+## Measuring time performance
+
+~~~~ {.haskell}
+module Length where
+
+len0 :: [a] -> Int
+len0 (_:xs) = 1 + len0 xs
+len0 _      = 0
+~~~~
+
+The standard Haskell tool for timing measurement is a package named
+criterion.
+
+~~~~ {.haskell}
+import Criterion.Main
+import Length
+
+main = defaultMain [ bench "len0" $ whnf len0 [0..100000] ]
+~~~~
+
+If we compile this to an executable, we'll have a fully usable
+benchmark program.
+
+## The moving parts
+
+The `defaultMain` function accepts a list of benchmarks to run.
+
+It parses a standard set of command line arguments, then runs the
+benchmarks.
+
+The `bench` function describes a single benchmark.
+
+* Its first argument is the name to print for the benchmark.
+
+* The second is a description of the actual function to benchmark.
+
+The `whnf` function describes *how* to run a benchmark.
+
+## How to run a benchmark
+
+criterion provides several ways to run a benchmark.
+
+For pure functions:
+
+* `whnf` accepts two arguments, a function and the last argument to
+  pass to the function.  It supplies the argument to the function,
+  then evaluates the result to weak head normal form (WHNF).
+  
+* `nf` is similar, but evaluates the result to normal form (NF).
+
+For impure `IO` actions:
+
+* `whnfIO` accepts an `IO` action, runs it, and evaluates the result
+  to WHNF.
+
+* `nfIO` accepts an `IO` action, runs it, and evaluates the result to
+  NF.
+
+## Why scrutinize the clock so closely?
+
+criterion works hard to be fully automatic.
+
+It considers clock *resolution*, the smallest unit by which the
+wallclock timer will increment.
+
+Why?
+
+* If a function takes on the order of the same amount of time (or
+  less) to evaluate, we must evaluate it many times to get a reliable
+  measurement.
+
+It also considers clock *cost*, i.e. how long it takes to ask the
+clock the current time.
+
+## Reporting numbers
+
+What about these numbers?
+
+~~~~
+benchmarking len0
+mean: 1.490665 ms, lb 1.458564 ms, ub 1.531022 ms, ci 0.950
+std dev: 183.9797 us, lb 151.8929 us, ub 242.1031 us, ci 0.950
+~~~~
+
+How come we're giving bounds (`lb` and `ub`) on the mean and standard
+deviation?
+
+Measuring is a noisy business.  These are estimates of the range
+within which 95% of measurements are falling.
+
+## GC Stats, part 1 of 4
+
+Let's break it all down, from top to bottom.
+
+~~~~
+   160,394,496 bytes allocated in the heap
+   104,813,280 bytes copied during GC
+    15,228,592 bytes maximum residency (9 sample(s))
+       328,112 bytes maximum slop
+	    36 MB total memory in use (0 MB lost due to fragmentation)
+~~~~
+
+Key statistics to look at:
+
+* `allocated in the heap`: total memory allocated during entire run
+
+* `copied during GC`: amount of memory that had to be copied because
+  it was alive
+  
+* `maximum residency`: largest amount of memory in use at one time
+
+## Stats, part 2 of 4
+
+Time spent in the garbage collector:
+
+~~~~
+				  Tot time (elapsed)  Avg pause  Max pause
+Gen  0       297 colls,     0 par    0.10s    0.10s     0.0003s    0.0021s
+Gen  1         9 colls,     0 par    0.08s    0.10s     0.0113s    0.0350s
+~~~~
+
+* GHC uses a generational GC, so we get a GC breakdown by generation.
+  Gen 0 is the nursery.
+  
+* `par` is the number of GC passes that used multiple CPUs in parallel.
+
+## Stats, part 3 of 4
+
+Where the program spent its time:
+
+~~~~
+INIT    time    0.00s  (  0.00s elapsed)
+MUT     time    0.12s  (  0.13s elapsed)
+GC      time    0.18s  (  0.20s elapsed)
+EXIT    time    0.00s  (  0.00s elapsed)
+Total   time    0.31s  (  0.33s elapsed)
+~~~~
+
+* `INIT`: starting the program
+
+* `MUT`: "mutation", the part where the program was doing useful work
+
+* `GC`: garbage collection
+
+* `EXIT`: shutdown
+
+There are two columns of numbers in case we're running on multiple
+cores.
+
+## Stats, part 4 of 4
+
+These are really the most useful numbers to look at:
+
+~~~~
+%GC     time      59.1%  (60.7% elapsed)
+
+Alloc rate    1,280,768,615 bytes per MUT second
+
+Productivity  40.9% of total user, 37.6% of total elapsed
+~~~~
+
+* If GC time is high and productivity is low, we're spending a lot of
+  time doing GC, which leaves less for real work.
+  
+* Are the numbers above healthy?  NO!  
+
+There were problems in our code - but what were they?
+
+## Next step: basic heap profiling
+
+Another standard RTS option:
+
+~~~~
+./WordFreq foo.txt +RTS -hT
+~~~~
+
+This generates a file named `WordFreq.hp`, which contains a *heap
+profile*, a time-based snapshot of what was in the heap and when,
+categorized by data constructor.
+
+We can't easily read a heap profile, so we use `hp2ps` to convert it
+to a PostScript file.
+
+~~~~
+hp2ps -c WordFreq.hp
+~~~~
+
+This will give us `WordFreq.ps`, which we can open in a suitable viewer.
+
+## Full heap profiling
+
+Basic heap profiling is useful, but GHC supports a much richer way to
+profile our code.
+
+This richer profiling support has a space and time cost, so we don't
+leave it turned on all the time.
+
+To use it, we must compile both libraries and programs with `-prof`.
+
+If you're using `cabal`, see the `--enable-library-profiling` and
+`--enable-executable-profiling` options.
+
+* As mentioned in an early lecture, simply leave `library-profiling`
+  set to `True` in your `$HOME/.cabal/config`.
+
+* With library profiling enabled, `cabal` will generate both normal
+  and profiled libraries, and will use the right one at the right
+  time.
+
+## More about full heap profiling
+
+The basics of full heap profiling are similar to what we saw with
+`-hT` and `hp2ps` a moment ago.
+
+The full profiler is a powerful facility, so it's worth reading
+[the profiling chapter of the GHC manual](http://www.haskell.org/ghc/docs/7.2.1/html/users_guide/profiling.html).
+
+In particular, to get much out of the profiler, you'll need to know
+about
+[cost centres](http://www.haskell.org/ghc/docs/7.2.1/html/users_guide/profiling.html#cost-centres),
+which are annotated expressions used for book-keeping when profiling.
+
+In many cases, you can simply use the `-auto-all` option to get GHC to
+annotate *all* top-level bindings with cost centres.
+
+You'll also want to use the
+[`-P` RTS option](http://www.haskell.org/ghc/docs/7.2.1/html/users_guide/prof-time-options.html),
+which writes a human-readable time and space profile into a file
+ending with a `.prof` extension.
+
+* *Caveat lector*: adding too many cost centres to your code,
+  particularly on hot code paths, will cause the profiler's
+  book-keeping to perturb your performance!
+
+## Welcome to Core
+
+Given our earlier definition of the function `len0`, suppose were to
+try this on the command line:
+
+~~~~
+ghc -c -ddump-simpl Length.hs
+~~~~
+
+And we'll see GHC dump a transformed version of our code in a
+language named *Core*.
+
+~~~~ {.haskell}
+Rec {
+Length.len0 [Occ=LoopBreaker]
+  :: forall a_abp. [a_abp] -> GHC.Types.Int
+[GblId, Arity=1]
+Length.len0 =
+  \ (@ a_aov) (ds_dpn :: [a_aov]) ->
+    case ds_dpn of _ {
+      [] -> GHC.Types.I# 0;
+      : ds1_dpo xs_abq ->
+        GHC.Num.+
+          @ GHC.Types.Int
+          GHC.Num.$fNumInt
+          (GHC.Types.I# 1)
+          (Length.len0 @ a_aov xs_abq)
+    }
+end Rec }
+~~~~
+
+## From the outside in
+
+~~~~ {.haskell}
+Rec {
+Length.len0 [Occ=LoopBreaker]
+  :: forall a_abp. [a_abp] -> GHC.Types.Int
+{- ... -}
+end Rec }
+~~~~
+
+* `Rec { ... }` indicates that we're looking at a recursive binding.
+
+* Notice that the `forall` that we're used to *not* seeing in Haskell
+  is *explicit* in Core (bye bye, syntactic sugar!).
+
+* Notice also that the type parameter named `a` in Haskell got renamed
+  to `a_abp`, so that it's unique.
+  
+* If `a` crops up in a signature for another top-level function, it
+  will be renamed to something different.  This "uniqueness renaming"
+  can sometimes make following types a little confusing.
+  
+* Type names are fully qualified: `GHC.Types.Int` instead of `Int`.
+
+## Function annotations
+
+~~~~ {.haskell}
+[GblId, Arity=1]
+~~~~
+
+* This is a global identifier, and is a function that takes one
+  parameter.
+
+## Type application
+
+~~~~ {.haskell}
+Length.len0 =
+  \ (@ a_aov) (ds_dpn :: [a_aov]) ->
+~~~~
+
+The '@' annotation here is a *type application*: GHC is applying the
+type `a_aov` (another renaming of `a`) to the function.
+
+Type applications are of little real interest to us right here, but at
+least we know what this notation is (and we'll see it again soon).
+
+## Case analysis, part 1
+
+~~~~ {.haskell}
+    case ds_dpn of _ {
+      [] -> GHC.Types.I# 0;
+~~~~
+
+This looks like regular Haskell.  Hooray!
+
+Since that's hardly interesting, let's focus on the right hand side
+above, namely this expression:
+
+~~~~ {.haskell}
+GHC.Types.I# 0
+~~~~
+
+The `I#` above is the value constructor for the `Int` type.
+
+This indicates that we are allocating a boxed integer on the heap.
+
+## Case analysis, part 2
+
+~~~~ {.haskell}
+      : ds1_dpo xs_abq ->
+~~~~
+
+Normal pattern matching on the list type's `:` constructor.  In Core,
+we use prefix notation, since we've eliminated syntactic sugar.
+
+~~~~ {.haskell}
+        GHC.Num.+
+          @ GHC.Types.Int
+          GHC.Num.$fNumInt
+~~~~
+
+We're calling the `+` operator, applied to the `Int` type.
+
+The use of `GHC.Num.$fNumInt` is a *dictionary*.
+
+* It indicates that we are passing the `Num` dictionary for the `Int`
+  type to `+`, so that it can determine which function to really call.
+
+In other words, dictionary passing has gone from implicit in Haskell
+to *explicit* in Core.  This will be really helpful!
+
+## The actual parameters to +
+
+Finally, we allocate an integer on the heap.
+
+We'll add it to the result of calling `len0` on the second argument to
+the `:` constructor, where we're applying the `a_aov` type again.
+
+~~~~ {.haskell}
+          (GHC.Types.I# 1)
+          (Length.len0 @ a_aov xs_abq)
+~~~~
+
+## Strictness in Core
+
+In System FC, all evaluation is controlled through `case` expressions.
+A use of `case` demands that an expression be evaluated to WHNF,
+i.e. to the outermost constructor.
+
+Some examples:
+
+~~~~ {.haskell}
+-- Haskell:
+foo (Bar a b) = {- ... -}
+
+-- Core:
+foo wa = case wa of _ { Bar a b -> {- ... -} }
+~~~~
+
+~~~~ {.haskell}
+-- Haskell:
+{-# LANGUAGE BangPatterns #-}
+let !a = 2 + 2 in foo a
+
+-- Core:
+case 2 + 2 of a { __DEFAULT -> foo a }
+~~~~
+
+~~~~ {.haskell}
+-- Haskell:
+a `seq` b
+
+-- Core:
+case a of _ { __DEFAULT -> b }
+~~~~
+
+## The evaluation stack
+
+There is no such thing as a regular "call stack" in Haskell, no
+analogue to the stack you're used to thinking of in C or Python or
+whatever.
+
+When GHC hits a `case` expression, and must evaluate a possibly
+thunked expression to WHNF, it uses an internal stack.
+
+This stack has a fixed size, which defaults to 8MB.
+
+The size of the stack is fixed to prevent a program that's stuck in an
+infinite loop from consuming all memory.
+
+Most of the time, if you have a thunk that requires anywhere close to
+8MB to evaluate, there's likely a problem in your code.
+
+## Pro tips
+
+If you're using GHC 7.2 or newer and want to read simplifier output,
+consider using options like `-dsuppress-all` to prevent GHC from
+annotating the Core.
+
+It makes the dumped Core more readable, but at the cost of information
+that is sometimes useful.
+
+There's a handful of these suppression options (see the GHC man page),
+so you can gain finer control over suppressions.
+
+Also, try installing and using the `ghc-core` tool to automate some of
+the pain:
+
+~~~~
+cabal install ghc-core
+~~~~
+
+Johan Tibell has a
+  [great slide deck](http://www.slideshare.net/tibbe/highperformance-haskell)
+  from a tutorial he gave last year
