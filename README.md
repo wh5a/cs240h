@@ -2700,3 +2700,158 @@ cabal install ghc-core
 Johan Tibell has a
   [great slide deck](http://www.slideshare.net/tibbe/highperformance-haskell)
   from a tutorial he gave last year
+
+# Parallelism
+
+## The Par monad
+
+The `monad-par` package provides a library that makes parallelism
+easier to achieve and reason about.
+
+~~~~
+cabal install monad-par
+~~~~
+
+It gives us a type named `Par`:
+
+~~~~ {.haskell}
+newtype Par a
+
+instance Functor Par
+instance Applicative Par
+instance Monad Par
+~~~~
+
+To evaluate a `Par` computation, we use `runPar`:
+
+~~~~ {.haskell}
+runPar :: Par a -> a
+~~~~
+
+Notice that this has no side effects, so it will run
+deterministically.
+
+## Building blocks
+
+To start a parallel computation, we use the `fork` action:
+
+~~~~ {.haskell}
+fork :: Par () -> Par ()
+~~~~
+
+Forked tasks need a way to communicate with each other, for which
+we use the `IVar` type:
+
+~~~~ {.haskell}
+data IVar a
+    deriving (Eq)
+
+new :: Par (IVar a)
+get :: IVar a -> Par a
+put :: (NFData a) => IVar a -> a -> Par ()
+~~~~
+
+The `IVar` type is a *write-once* mutable reference.  The `get`
+function blocks until a `put` has been performed.
+
+## Higher level operations
+
+An extremely common pattern is for a thread to `fork` several children
+and wait for them to finish.
+
+We can easily capture this idea with a suitable combinator.
+
+~~~~ {.haskell}
+spawn :: (NFData a) => Par a -> Par (IVar a)
+spawn act = do
+  i <- new
+  fork (put i =<< act)
+  return i
+~~~~
+
+In fact, usually all we want is to simply wait for all children and
+return a list of their results.
+
+~~~~ {.haskell}
+parMapM :: (NFData b) => (a -> Par b) -> [a] -> Par [b]
+parMapM f acts = do 
+  ivars <- mapM (spawn . f) acts
+  mapM get ivars
+~~~~
+
+## Questionable numbers
+
+Supposing we have a set of sample data that we know little about, in
+particular its precision and variance.
+
+This is exactly the kind of problem that the criterion benchmarking
+library faces: we have performance data, but it's dirty and doesn't
+follow any particular statistical distribution.
+
+A technique called the
+[jackknife](http://en.wikipedia.org/wiki/Resampling_(statistics)) lets
+us estimate these parameters.
+
+We successively recompute a function (such as `mean`) over subsets of
+a sample, each time with a sliding window cut out.
+
+For a $w$-width window and $k$ samples, the jackknife has a cost of
+$O((k-w)^2)$.
+
+~~~~ {.haskell}
+jackknife :: ([a] -> b) -> [a] -> [b]
+jackknife f = map f . resamples 500
+~~~~
+
+## Resampling
+
+It's easy to write a resampling function using familiar building
+blocks.
+
+~~~~ {.haskell}
+resamples :: Int -> [a] -> [[a]]
+resamples k xs =
+    take (length xs - k) $
+    zipWith (++) (inits xs) (map (drop k) (tails xs))
+~~~~
+
+Our function resamples a list with a window size of `k`.
+
+~~~~ {.haskell}
+>> resamples 2 [0..5]
+[[    2,3,4,5],
+ [0,    3,4,5],
+ [0,1,    4,5],
+ [0,1,2,    5]]
+~~~~
+
+## Speeding up the jackknife
+
+The nice thing about the jackknife is that each element of the result
+list is independent, so it's an "embarrassingly parallel" problem.
+
+The `monad-par` package is very helpful in making this trivial to
+parallelize.
+
+~~~~ {.haskell}
+import Control.Monad.Par (runPar, parMap)
+
+jackknifeP f = runPar . parMap f . resamples 500
+~~~~
+
+## A test program
+
+~~~~ {.haskell}
+import System.Random.Mersenne
+
+crud = zipWith (\x a -> sin (x / 300)**2 + a) [0..]
+
+main = do
+  (xs,ys) <- splitAt 1500 . take 6000 <$> (randoms =<< getStdGen)
+  let rs = crud xs ++ ys
+  putStrLn $ "sample mean:    " ++ show (mean rs)
+
+  let j = jackknifeP mean rs
+  putStrLn $ "jack mean min:  " ++ show (minimum j)
+  putStrLn $ "jack mean max:  " ++ show (maximum j)
+~~~~
