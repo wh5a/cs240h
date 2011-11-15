@@ -2504,7 +2504,7 @@ ghc -c -ddump-simpl Length.hs
 ~~~~
 
 And we'll see GHC dump a transformed version of our code in a
-language named *Core*.
+language named *[Core](http://blog.ezyang.com/2011/04/tracing-the-compilation-of-hello-factorial/)*.
 
 ~~~~ {.haskell}
 Rec {
@@ -2855,3 +2855,287 @@ main = do
   putStrLn $ "jack mean min:  " ++ show (minimum j)
   putStrLn $ "jack mean max:  " ++ show (maximum j)
 ~~~~
+
+# GHC
+
+## Core in one slide
+
+~~~
+variables, literals, let, case, lambda abstraction, application
+~~~
+
+~~~~ {.haskell}
+data Expr b -- "b" for the type of binders, 
+  = Var    Id
+  | Lit   Literal
+  | App   (Expr b) (Arg b)
+  | Lam   b (Expr b)
+  | Let   (Bind b) (Expr b)
+  | Case  (Expr b) b Type [Alt b]
+
+  | Type  Type
+  | Cast  (Expr b) Coercion
+  | Coercion Coercion
+
+  | Tick  (Tickish Id) (Expr b)
+
+data Bind b = NonRec b (Expr b)
+            | Rec [(b, (Expr b))]
+
+type Arg b = Expr b
+
+type Alt b = (AltCon, [b], Expr b)
+
+data AltCon = DataAlt DataCon | LitAlt  Literal | DEFAULT
+~~~~
+
+## Functions -> Core
+
+Haskell
+
+~~~~ {.haskell}
+idChar :: Char -> Char
+idChar c = c
+
+id :: a -> a
+id x = x
+
+idChar2 :: Char -> Char
+idChar2 = id
+~~~~
+
+[Core](http://hackage.haskell.org/trac/ghc/wiki/Commentary/Compiler/CoreSynType)
+
+~~~~ {.haskell}
+idChar :: GHC.Types.Char -> GHC.Types.Char
+[GblId, Arity=1, Caf=NoCafRefs]
+idChar = \ (c :: GHC.Types.Char) -> c
+
+id :: forall a. a -> a
+id = \ (@ a) (x :: a) -> x
+
+idChar2 :: GHC.Types.Char -> GHC.Types.Char
+idChar2 = id @ GHC.Types.Char
+~~~~
+
+* [GblId...] specifies various metadata about the function
+* Functions are all lambda abstractions
+* Explicit passing and instantiation of type variables
+    * type variables are proceeded by @ symbol (read them as 'at type
+      ...')
+    * they are passed abstracted and passed around just like value
+      variables
+    * this is known as second order lambda calculus
+    * GHC uses this representation because it makes preserving type
+      information during optimization easy
+
+Haskell
+
+~~~~ {.haskell}
+map :: (a -> b) -> [a] -> [b]
+map _ []     = []
+map f (x:xs) = f x : map f xs
+~~~~
+
+Core
+
+~~~~ {.haskell}
+map :: forall a b. (a -> b) -> [a] -> [b]
+map =
+  \ (@ a) (@ b) (f :: a -> b) (xs :: [a]) ->
+    case xs of _ {
+      []     -> GHC.Types.[] @ b;
+      : y ys -> GHC.Types.: @ b (f y) (map @ a @ b f ys)
+    }
+~~~~
+
+* case statements are only place evaluation happens, read them as
+  'evaluate'
+    * they take an extra variable just after `of` that captures the
+      return value of the scrutinee
+* names are fully qualified
+
+## Data -> Core
+
+Haskell
+
+~~~~ {.haskell}
+data Maybe a = Nothing | Just a
+
+none = Nothing
+some = Just (1 :: Int)
+~~~~
+
+Core
+
+~~~~ {.haskell}
+none :: forall a. Maybe a
+none = Nothing
+
+n :: GHC.Types.Int
+n = GHC.Types.I# 1
+
+some :: Maybe GHC.Types.Int
+some = Just @ GHC.Types.Int n
+~~~~
+
+* Data types don't explicitly appear in Core
+    * Core supports datatype but just no syntax for them at this level
+<!--  e.g Its a struct definition, what code should be generated? None, only values appear as code -->
+* Can see how GHC lifts constants out to the top level (CAFs)
+* Can also see boxing and primitive types
+    * In general Core follows same syntactic rules as Haskell (e.g
+      Uppercase = Data constructor, # = unboxed value / type)
+
+## Sharing & Updating
+
+Haskell
+
+~~~~ {.haskell}
+sum100 :: Int -> Int
+sum100 n = n * (foldr (+) 0 [1..100])
+~~~~
+
+Core
+
+~~~~ {.haskell}
+-- Unoptimized
+sum100n = \ (n :: Int) -> * n (foldr (I# 0) (enumFromTo (I# 1) (I# 100)))
+
+-- Optimized
+sum100n = \ (n :: Int) -> GHC.Base.timesInt n sum100n1
+
+sum100n1 = case $wgo 1 of r { __DEFAULT -> GHC.Types.I# r }
+
+$wgo :: Int# -> Int#
+$wgo = \ (w :: Int#) ->
+    case w of w'
+      __DEFAULT -> case $wgo (GHC.Prim.+# w' 1) of r
+                      __DEFAULT -> GHC.Prim.+# w' r
+      100 -> 100
+~~~~
+
+* For the optimized case GHC lifts the constant expression out so its
+  only computed once and then shared
+* Optimized version creates a new function called `$wgo` which means
+  'worker'. This version works with unboxed types for efficiency.
+* The __DEFAULT alternative must appear first. This makes finding a
+  DEFAULT alternative easy, when it exists.
+
+## Partial Evaluation -> Core
+
+Haskell
+
+~~~~ {.haskell}
+add :: Int -> Int -> Int
+add x y = x + y
+
+add2 :: Int -> Int
+add2 = add 2
+~~~~
+
+Core (unoptimized)
+
+~~~~ {.haskell}
+add :: GHC.Types.Int -> GHC.Types.Int -> GHC.Types.Int
+add =
+  \ (x :: GHC.Types.Int) (y :: GHC.Types.Int) ->
+    GHC.Num.+ @ GHC.Types.Int GHC.Num.$fNumInt x y
+
+x :: GHC.Types.Int
+x = GHC.Types.I# 2
+
+add2 :: GHC.Types.Int -> GHC.Types.Int
+add2 =
+  \ (y :: GHC.Types.Int) ->
+    GHC.Num.+ @ GHC.Types.Int GHC.Num.$fNumInt x y
+~~~~
+
+* (+) function used is the polymorphic `GHC.Num.+` variant
+    * `GHC.Num.+ @ GHC.Types.Int GHC.Num.$fNumtInt` means, select the
+      (+) field from the GHC.Types.Int dictionary (which is retrieved
+      from GHC.Num.$fNumInt) for the GHC.Num type class
+
+Core (optimized)
+
+~~~~ {.haskell}
+add :: GHC.Types.Int -> GHC.Types.Int -> GHC.Types.Int
+Hs2Core.add = GHC.Base.plusInt
+
+x :: GHC.Types.Int
+x = GHC.Types.I# 2
+
+add2 :: GHC.Types.Int -> GHC.Types.Int
+add2 = GHC.Base.plusInt x
+~~~~
+
+* type class dictionary method has been inlined.
+
+The function `GHC.Base.plusInt` is implemented as:
+
+~~~~ {.haskell}
++ :: Int -> Int -> Int
++ = \ a b -> case a of _
+                 I# a_ -> case b of _
+                              I# b_ -> I# (GHC.Prim.+# a_ b_)
+~~~~
+
+* Notice the evaluation and unboxing of each argument, followed
+  finally by reboxing.
+
+## Type Classes -> Core
+
+Haskell
+
+~~~~ {.haskell}
+typeclass MyEnum a where
+   toId  :: a -> Int
+   fromId :: Int -> a
+
+instance MyEnum Int where
+   toId = id
+   fromId = id
+
+instance (MyEnum a) => MyEnum (Maybe a) where
+   toId (Nothing) = 0
+   toId (Just n)  = 1 + toId n
+   fromId 0       = Nothing
+   fromId n       = Just (fromId $ n - 1)
+~~~~
+
+Core
+
+~~~~ {.haskell}
+toId :: forall a. MyEnum a => a -> GHC.Types.Int
+toId =
+  \ (@ a) (d :: MyEnum a) ->
+    case d of _ { D:MyEnum f1 _ -> f1 }
+
+fromId :: forall a. MyEnum a => GHC.Types.Int -> a
+fromId =
+  \ (@ a) (d :: MyEnum a) ->
+    case d of _ { D:MyEnum _ f2 -> f2 }
+
+$fMyEnumInt :: MyEnum GHC.Types.Int
+$fMyEnumInt = D:MyEnum @ GHC.Types.Int (id @ GHC.Types.Int) (id @ GHC.Types.Int)
+
+$fMyEnumMaybe :: forall a. MyEnum a => MyEnum (Maybe a)
+$fMyEnumMaybe =
+  \ (@ a) ($dMyEnum_arR :: MyEnum a) ->
+    D:MyEnum @ (Maybe a_acF)
+      ($fMyEnumMaybe_$ctoId @ a $dMyEnum_arR)
+      ($fMyEnumMaybe_$cfromId @ a $dMyEnum_arR)
+
+$fMyEnumMaybe_$ctoId :: forall a. Hs2Core.MyEnum a => Hs2Core.Maybe a -> GHC.Types.Int
+$fMyEnumMaybe_$ctoId =
+  \ (@ a) ($dMyEnum_arR :: MyEnum a) (ds :: Maybe a) ->
+    case ds of _
+      Nothing -> GHC.Types.I# 0
+      Just n  -> case toId @ a $dMyEnum_arR n of _ 
+                    GHC.Types.I# y -> GHC.Types.I# (GHC.Prim.+# 1 y)
+~~~~
+
+* Typeclasses are implemented via _dictionaries_
+    * Just a data structure storing the various functions for each field
+    * Functions that have type class constraints take an extra dictionary argument
+    * GHC will optimize away this dictionary passing when it can
