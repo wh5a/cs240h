@@ -3139,3 +3139,638 @@ $fMyEnumMaybe_$ctoId =
     * Just a data structure storing the various functions for each field
     * Functions that have type class constraints take an extra dictionary argument
     * GHC will optimize away this dictionary passing when it can
+
+## Core Summary
+
+* Look at Core to get an idea of how your code will perform
+   * Lots of noise in Core, so best to clean up manually (or play with
+     various flags to suppress some of the noise)
+* Some rules:
+    * Pattern matching and guards are translated to case statements
+    * `where` statements become `let` statements
+    * language still lazy but looking for `let` and `case` gives you a
+      good idea of evaluation order
+    * `case` means evaluation. (e.g `seq` is translated to `case`)
+    * `let` statements are allocation of closures
+    * function application is a thunk
+    * operations involving unboxed types are eager
+
+## Some standard optimisations
+
+* GHC does some stock standard optimisations: Inlining, Common
+  Subexpression Elimination, Dead Code Elimination
+* A large set of simple, local optimisations (e.g constant folding)
+  are done in one pass called the _simplifier_. It is run repeatedly
+  until no further changes can be done (with a fixed maximum number
+  of iterations).
+* These are only the basic, big win ones. All the other standard stuff
+  (e.g strength reduction, loop induction...) are missing.
+* We get a lot of this for free though if we use the LLVM backend.
+
+Rest of the optimisations GHC does are fairly specific to a functional
+language. Lets look at a few of them.
+
+~~~~
+Fun Fact: Estimated that functional languages gain 20 - 40%
+improvement from inlining Vs. imperative languages which gain 10 - 15%
+~~~~
+
+## STG Code
+
+* STG is very similar to Core but has one nice additional property:
+    * laziness is 'explicit'
+    * `case` = _evaluation_ and ONLY place evaluation occurs (true in
+      Core)
+    * `let` = _allocation_ and ONLY place allocation occurs (not true
+      in Core)
+    * So in STG we can explicitly see thunks being allocated for
+      laziness using `let`
+
+* To view STG use: 
+
+    ~~~~
+    ghc -ddump-stg A.hs > A.stg
+    ~~~~
+
+## Naive compilation of factorial
+
+Consider this factorial implementation in Haskell:
+
+~~~~ {.haskell}
+fac :: Int -> Int -> Int
+fac a 0 = a
+fac a n = fac (n*a) (n-1)
+~~~~
+
+STG
+
+~~~~ {.haskell}
+fac = \ a n -> case n of 
+                   I# n# -> case n# of
+                                0# -> a
+                                _  -> let one = I# 1;
+                                          x = n - one
+                                          y = n * a;
+                                      in  fac y x
+~~~~
+
+* We allocate thunks before the recursive call and box arguments
+* But `fac` will immediately evaluate the thunks and unbox the values!
+* With this strictness knowledge, the boxing and thunk creation are
+  unnecessary overhead
+
+## GHC with strictness analysis and unboxing
+
+If we compile in GHC with optimisations turned on:
+
+~~~~ {.haskell}
+one = I# 0#
+
+-- worker :: Int# -> Int# -> Int#
+$wfac = \ a# n# -> case n# of
+                     0#  -> a#
+                     n'# -> case (n'# -# 1#) of
+                                m# -> case (n'# *# a#) of
+                                           x# -> $wfac x# m#
+
+-- wrapper :: Int -> Int -> Int
+fac = \ a n -> case a of
+                    I# a# -> case n of
+                                 I# n# -> case ($wfac a# n#) of
+                                              r# -> I# r#
+~~~~
+
+* Strictness analysis has discovered that `fac` is strict in both
+  arguments
+* So creates a new 'worker' variant of `fac` that uses unboxed types
+  and no thunks
+* Keeps original function `fac` though, referred to as the 'wrapper'
+  to supply the correct type interface for other code.
+* As the wrapper uses unboxed types and is tail recursive, this will
+  compile to a tight loop in machine code!
+
+## SpecConstr
+
+The idea of the SpecConstr pass is to extend the strictness and
+unboxing from before but to functions where arguments aren't strict in
+every code path.
+
+Consider this Haskell function:
+
+~~~~ {.haskell}
+drop :: Int -> [a] -> [a]
+drop n []     = []
+drop 0 xs     = []
+drop n (x:xs) = drop (n-1) xs
+~~~~
+
+* Would like to pass `n` unboxed but it isn't strict in the first
+  pattern
+
+So we get this code in STG:
+
+~~~~ {.haskell}
+drop n xs = case xs of
+              []     -> []
+              (y:ys) -> case n of 
+                          I# n# -> case n# of
+                                      0 -> []
+                                      _ -> drop (I# (n# -# 1#)) xs
+~~~~
+
+* Notice how after the first time this function is called and we start
+  recursing, we could pass `n` unboxed
+
+The SpecConstr pass takes advantage of this to create a specialised
+version of `drop` that is only called after we have passed the first
+check where we may not want to evaluate `n`.
+
+Basically we aren't specialising the whole function but a particular
+branch of it that is heavily used (ie. recursive)
+
+~~~~ {.haskell}
+drop n xs = case xs of
+              []     -> []
+              (y:ys) -> case n of 
+                          I# n# -> case n# of
+                                      0 -> []
+                                      _ -> drop' (n# -# 1#) xs
+
+-- works with unboxed n
+drop' n# xs = case xs of
+               []     -> []
+               (y:ys) -> case n# of
+                           0# -> []
+                           _  -> drop (n# -# 1#) xs
+~~~~
+
+* To stop the code size blowing up GHC limits the amount of
+  specialized functions it creates, specified with the
+  `-fspec-constr-threshold` and `-fspec-constr-count` flags
+
+## _STG -> Cmm_
+
+So what has been handled and what is left to handle?
+
+*  By the STG stage we have:
+    * Simplified Haskell to a handful of constructs (variables,
+      literal, let, lambda, case and application)
+    * type classes, monads have all been dealt with
+    * laziness is nearly explicit through let constructs for
+      allocation and case for evaluation
+
+* So we still have to deal with:
+    * Compiling these constructs efficiently, big focus will be
+      handling closures and garbage collection (lazy functional
+      languages involve a lot of allocation of short lived objects)
+    * Call convention & partial application (only remaining implicit allocation)
+    * Evaluating thunks and handling updates
+    * Heap and Stack layout
+    * Graph reduction: thunks, update frames and black holes
+    * Case statements
+    * Pointer tagging and evaluation
+
+## Closure Representation
+
+The STG machine represents function and data values as heap allocated
+_closures_. In GHC all Heap objects have the same layout:
+
+<center>
+<table>
+<tr><td>Closure</td><td></td><td></td><td>Info Table</td></tr>
+<tr>
+<td> ![](heap-object.png) </td>
+<td> </td>
+<td> </td>
+<td> ![](basic-itbl.png) </td>
+</tr> </table>
+</center>
+
+* Header differs depending on closure type, all contain a pointer to
+  code though (even if it represents a value!)
+* Payload contains the closures environment (e.g free variables,
+  function arguments)
+* Layout describes the layout of payload for the garbage collector
+* Notice how the pointer for the info table points to both the info
+  table and the code that will evaluate the closure
+
+## Closure Representation
+
+* Data Constructors:
+
+    ~~~~ {.haskell}
+    data G = G (Int -> Int) {-# UNPACK #-} !Int
+    ~~~~
+
+    * [Header | Pointers... | Non-pointers...]
+    * Payload is the values for the constructor
+    * Closure types of: CONSTR, CONSTR_p_n, CONSTR_STATIC
+    * Entry code for a constructor just returns
+
+* Thunks:
+
+    ~~~~ {.haskell}
+    range = between 1 10
+    f = \x -> let ys = take x range
+              in sum ys
+    ~~~~
+   
+    * [Header | Pointers... | Non-pointers...]
+    * Payload contains the free variables of the expression
+    * Differ from function closure in that they can be updated
+    * Clousre types of: THUNK, THUNK_p_n, THUNK_STATIC (`range` is a
+      static thunk, `ys` is a dynamic thunk)
+    * Entry code is the code for the expression
+
+* Function Closures:
+
+    ~~~~ {.haskell}
+    f = \x -> let g = \y -> x + y
+              in g x
+    ~~~~
+
+    * [Header | Pointers... | Non-pointers...]
+    * Payload is the bound free variables (e.g in example above, g is
+      the function closure and x would be in its payload)
+    * Function types of: FUN, FUN_p_n, FUN_STATIC
+    * Entry code is the function code
+
+* Partial Applications (PAP):
+
+    ~~~~ {.haskell}
+    foldr (:)
+    ~~~~
+
+    * [Header | Arity | Payload size | Function closure | Payload]
+    * Arity of the PAP (function of arity 3 with 1 argument applied
+      gives PAP of arity 2)
+    * Function closure is the function that has been partially applied
+    * PAPs should never be entered so the entry code is some failure
+      code
+
+## Heap & Stack Layout
+
+GHC has a very nice uniform way of managing the heap and stack.
+
+* Heap:
+    * Heap at the lowest level is a linked list of blocks.
+    * All objects in the heap are represented by closure objects
+    * Even when for some of them the entry code doesn't make sense
+    * When entry code doesn't make sense, the code will either be
+      code that simply returns or code that throws and error
+
+* Stack:
+    * The stack consists of a sequence of _frames_
+    * Each frame has the same layout as a heap object! So the stack
+      and the heap can often be treated uniformily
+    * Stacks until very recently were a single contiguous block of
+      memory. They are now a linked list of stack chunks.
+    * chunked stacks can be grown far easier but also are quicker to
+      traverse during GC since we can avoid entire chunks of the
+      stack if they haven't been touched since last GC.
+
+* TSO (thread state object):
+    * Represents the complete state of a thread including it stack
+    * Are ordinary objects that live in the heap
+    * Important benefit of this approach is the GC can detect when
+      a blocked thread is unreachable and so will never be runnable
+      again
+
+## Call Convention
+
+<!--
+(during a call is the only time a stack doesn't simply consist of
+closure objects as there are now arguments at the top)
+-->
+
+* GHC compiles code into a form called _Continuation Passing Style_:
+    * The idea here is that no function ever returns
+    * Instead a function returns by jumping to the closure at the top
+      of the stack
+    * Basically the code is always jumping from closure to closure so
+      before calling a function we simply setup the stack correctly to
+      have the control chain on it we want.
+* Call convention is simple: first _n_ arguments in registers, rest on
+  the stack
+* When entering a closure (a common case) the first argument is
+  always a pointer to the closures heap object (node) so it can access
+  its environment
+    * _entering_: In the context of a closure it means evaluating it
+    * _node_: Node in the context of the entry code for a closure is a
+      pointer to the environment for the closure
+* Return convention is also simple, return is made by jumping to the
+  entry code associated with the _info table_ of the topmost stack
+  frame OR in some cases we set the _R1_ register to point to the
+  return closure
+
+~~~~ {.haskell}
+id' x = x
+~~~~
+
+~~~~ {.c}
+A_idzq_entry()
+    R1 = R2;
+    jump stg_ap_0_fast ();
+~~~~
+
+~~~~ {.c}
+stg_ap_0_fast { 
+  ENTER();
+}
+
+#define ENTER()
+  // ...
+  case
+    FUN,
+    // ...
+    PAP:     { jump %ENTRY_CODE(Sp(0)); }
+    default: { info = %INFO_PTR(UNTAG(R1)); jump %ENTRY_CODE(info); }
+~~~~
+
+Calling a known Haskell function:
+
+Haskell
+
+~~~~ {.haskell}
+x :: Int -> Int
+x z = (+) 2 (id z)
+~~~~
+
+Cmm
+
+~~~~ {.c}
+I64[Hp - 8] = spH_info;                  // create thunk on heap
+I64[Hp + 0] = R2;                        // R2 = z, store argument in closure
+R2 = stg_INTLIKE_closure+289;            // first argument (static closure for '2')
+R3 = Hp - 16;                            // second argument (closure pointer)
+jump base_GHCziBase_plusInt ();          // call (+) function
+~~~~ 
+
+What happens though when we are calling an unknown function?
+
+Haskell
+
+~~~~ {.haskell}
+unknown_app :: (Int -> Int) -> Int -> Int
+unknown_app f x = f x
+~~~~
+
+Cmm
+
+~~~~ {.c}
+unknownzuapp_entry() {
+    cnO:
+        R1 = R2;
+        Sp = Sp + 4;
+        jump stg_ap_p_fast ();
+}
+~~~~
+
+* Here we don't call the function directly as we don't statically known
+  the arity of the function.
+
+* To deal with this, the STG machine has several pre-compiled functions
+  that handle 'generic application'
+
+* Generic application has three cases to deal with:
+    * The functions arity and number of arguments match! So we simply
+      make a tail call to the functions entry code.
+    * The functions arity is greater than the number of supplied
+      argumnts. In this case we build a PAP closure and return that
+      closure to the continuation at the top of the stack
+    * The functions arity is less than the number of supplied
+      arguments. Here we push the number of arguments matching the
+      functions arity onto the stack, followed by a new continuation
+      that uses another generic apply function to deal with the
+      remaining arguments and the function that should be returned by
+      the first function.
+
+## Data Constructors
+
+Haskell
+
+~~~~ {.haskell}
+10
+~~~~
+
+Cmm
+
+~~~~ {.c}
+section "data" {
+    A_ten_closure:
+        const ghczmprim_GHCziTypes_Izh_static_info;
+        const 10;
+}
+~~~~
+
+* Pointer to Constructor (`I#`)
+* arguments to constructor (`10`)
+
+## Pointer Tagging
+
+* An optimization that GHC does is _pointer tagging_. The trick is to
+  use the final bits of a pointer which are usually zero (last 2 for
+  32bit, 3 on 64) for storing a 'tag'.
+
+* GHC uses this tag for:
+    * If the object is a constructor, the tag contains the constructor
+      number (if it fits)
+    * If the object is a function, the tag contains the arity of the
+      function (if it fits)
+
+* One optimization tag bit enable is that we can detect if a closure
+  has already been evaluated (by the presence of tag bits) and avoid
+  entering it
+
+## Data Constructors
+
+Haskell
+
+~~~~ {.haskell}
+build_just :: a -> Maybe a
+build_just x = Just x
+~~~~
+
+Cmm
+
+~~~~ {.c}
+buildzujust_entry()
+    crp:
+        Hp = Hp + 16;
+        if (Hp > HpLim) goto crt;                        // Allocte heap space
+        I64[Hp - 8] = base_DataziMaybe_Just_con_info;    // Just constructor tag
+        I64[Hp + 0] = R2;                                // store x in Just
+        R1 = Hp - 6;                                     // setup R1 as argument to continuation
+                                                         //     (we do '- 6' and not '8' to set the pointer tag)
+        jump (I64[Sp + 0]) ();                           // jump to continuation
+    cru:
+        R1 = buildzujust_closure;
+        jump stg_gc_fun ();
+    crt:
+        HpAlloc = 16;
+        goto cru;
+}
+~~~~
+
+## Case Statements
+
+Haskell
+
+~~~~ {.haskell}
+mycase :: Maybe Int -> Int
+mycase x = case x of Just z -> z; Nothing -> 10
+
+~~~~
+
+Cmm
+
+~~~~ {.c}
+mycase_entry()                          // corresponds to forcing 'x'
+    crG:
+        R1 = R2;                        // R1 = 'x'
+        I64[Sp - 8] = src_info;         // setup case continuation
+        Sp = Sp - 8;
+        if (R1 & 7 != 0) goto crL;      // check pointer tag to see if x eval'd
+        jump I64[R1] ();                // x not eval'd, so eval
+    crL:
+        jump src_info ();               // jump to case continuation
+}
+
+src_ret()                               // case continuation
+    crC:
+        v::I64 = R1 & 7;                // get tag bits of 'x' and put in local variable 'v'
+        if (_crD::I64 >= 2) goto crE;   // can use tag bits to check which constructor we have
+        R1 = stg_INTLIKE_closure+417;   // 'Nothing' case
+        Sp = Sp + 8;                    // pop stack
+        jump (I64[Sp + 0]) ();          // jump to continuation ~= return
+    crE:
+        R1 = I64[R1 + 6];               // get 'z' thunk inside Just
+        Sp = Sp + 8;                    // pop stack
+        R1 = R1 & (-8);                 // clear tags on 'z'
+        jump I64[R1] ();                // force 'z' thunk
+}
+~~~~
+
+## Graph Reduction: Thunks, Updates & Indirections
+
+Lets take a look at the code for the `(x + 1)` thunk:
+
+~~~~ {.haskell}
+build_data :: Int -> Maybe Int
+build_data x = Just (x + 1)
+~~~~
+
+Cmm
+
+~~~~ {.c}
+sus_entry()
+    cxa:
+        if (Sp - 24 < SpLim) goto cxc;
+        I64[Sp - 16] = stg_upd_frame_info;  // setup update frame (closure type)
+        I64[Sp -  8] = R1;                  // set thunk to be updated (payload)
+        I64[Sp - 24] = sut_info;            // setup continuation (+) continuation
+        Sp = Sp - 24;                       // increase stack
+        R1 = I64[R1 + 16];                  // grab 'x' from environment
+        if (R1 & 7 != 0) goto cxd;          // check if 'x' is eval'd
+        jump I64[R1] ();                    // not eval'd so eval
+    cxc: jump stg_gc_enter_1 ();
+    cxd: jump sut_info ();                  // 'x' eval'd so jump to (+) continuation
+}
+
+sut_ret()
+    cx0:
+        Hp = Hp + 16;
+        if (Hp > HpLim) goto cx5;
+        v::I64 = I64[R1 + 7] + 1;           // perform ('x' + 1)
+        I64[Hp - 8] = ghczmprim_GHCziTypes_Izh_con_info; // setup Int closure
+        I64[Hp + 0] = v::I64;               // setup Int closure
+        R1 = Hp - 7;                        // point R1 to computed thunk value (with tag)
+        Sp = Sp + 8;                        // pop stack
+        jump (I64[Sp + 0]) ();              // jump to continuation ('stg_upd_frame_info')
+    cx6: jump stg_gc_enter_1 ();
+    cx5:
+        HpAlloc = 16;
+        goto cx6;
+}
+~~~~
+
+* The interesting thing here is that once the thunk is forced and
+  computes `(x + 1)` it doesn't return to the continuation at the top
+  of the stack
+
+~~~~ {.c}
+I64[Sp - 16] = stg_upd_frame_info;  // setup update frame (closure type)
+I64[Sp -  8] = R1;                  // set thunk to be updated (payload)
+~~~~
+
+* Instead it returns to the `stg_upd_frame_info` function
+* This function is reponsible for taking the thunks computed value and
+  replacing the thunk with this computed value to avoid it being
+  recomputed
+* The replacing is done by changing the entry code for the thunk to be
+  an 'indirection' which is simply code that returns a pointer to
+  another closure.
+* The GC will remove indirections during copying, changing code that
+  pointed to a indirection (evaluated thunk) to the actual value
+  closure.
+
+## RTS & Garbage Collection
+
+* [Block Allocator](http://hackage.haskell.org/trac/ghc/wiki/Commentary/Rts/Storage/BlockAlloc)
+  is at the base of the GC:
+    * Uses a linked list of blocks where within a block we allocate
+      using a simple bump pointer (heap and stack mangaged this way)
+    * Bump pointer is where we simply have a current block to allocate with
+      a pointer to the next free space to allocate in. To allocate we check
+      there is enough space left in the block and if so bump the pointer
+    * Block size is chosen such that it's rare we need to allocate an
+      object larger than a block
+
+    ~~~~ {.c}
+    AMod_abc_entry:
+      entry:
+        _v = R2                        // collect arguments
+        _w = R3
+        if (Sp - 40 < SpLim) goto spL  // check enough stack free
+        Hp = Hp + 20                   // allocate heap space
+        if (Hp > HpLim) goto hpL       // check allocation is ok
+
+        [... funtion code now we have stack and heap space needed ...]
+    
+        Sp = Sp - 32                   // bump stack pointer to next free word
+        jump ...                       // jump to next continuation
+
+      hpL:
+        HpAlloc = 20                   // inform how much hp space we need
+
+      spL:
+        R1 = AMod_abc_closure;         // set return point
+        jump stg_gc_fun                // call GC
+    ~~~~
+
+    * Above is the _Cmm_ code typically generated for functions that
+      need to allocate. Notice we simply bump the `Hp` and `Sp`
+      registers for allocation after we check there is enough space.
+    * We don't need to tell the GC how much stack to allocate as it
+      just allocates the stack in fixed block sizes
+
+## Resources & References
+
+Here are some resources to learn about GHC, they were also used to
+create these slides:
+
+* GHC Wiki: [Developer Documentation](http://hackage.haskell.org/trac/ghc/wiki/Commentary)
+* GHC Wiki: [I know kung fu: learning STG by example](http://hackage.haskell.org/trac/ghc/wiki/Commentary/Compiler/GeneratedCode)
+* Wikipedia: [System F](http://en.wikipedia.org/wiki/System_F)
+* Paper: [Multi-paradigm Just-In-Time Compilation](http://www.cse.unsw.edu.au/~pls/thesis/dons-thesis.ps.gz)
+* Paper: [Implementing lazy functional languages on stock hardware: the Spineless Tagless G-machine](http://research.microsoft.com/en-us/um/people/simonpj/papers/spineless-tagless-gmachine.ps.gz#26pub=34)
+* Paper: [Implementing Functional Languages: a tutorial](http://research.microsoft.com/en-us/um/people/simonpj/papers/pj-lester-book/)
+* Paper: [Runtime support for Multicore Haskell](http://research.microsoft.com/apps/pubs/default.aspx?id=79856)
+* Paper: [Multicore Garbage Collection with Local Heaps](http://www.google.com/url?sa=t&rct=j&q=Multicore%2BGarbage%2BCollection%2Bwith%2BLocal%2BHeaps&source=web&cd=1&ved=0CCAQFjAA&url=http%3A%2F%2Fcommunity.haskell.org%2F~simonmar%2Fpapers%2Flocal-gc.pdf&ei=YmXBTq3hLoatiAKq3tT5Ag&usg=AFQjCNGH0SgCfqpKQkQxq11Azl3btSk5Dw&sig2=OVzFyZrZRopkhlo7yriv_w)
+* Paper: [Parallel generational-copying garbage collection with a block-structured heap](http://research.microsoft.com/en-us/um/people/simonpj/papers/parallel-gc/index.htm)
+* Paper: [Making a fast curry: Push/enter vs eval/apply for higher-order languages](http://research.microsoft.com/en-us/um/people/simonpj/papers/eval-apply/)
+* Paper: [An External Representation for the GHC Core Language](http://www.haskell.org/ghc/docs/6.10.4/html/ext-core/core.pdf)
+* Paper: [A transformation-based optimiser for Haskell](http://research.microsoft.com/~simonpj/Papers/comp-by-trans-scp.ps.gz)
+* Paper: [Playing by the rules: rewriting as a practical optimisation technique in GHC](http://research.microsoft.com/~simonpj/Papers/rules.htm)
+* Paper: [Secrets of the Inliner](http://www.research.microsoft.com/~simonpj/Papers/inlining/index.htm)
+* Paper: [Unboxed Values as First-Class Citizens](http://www.haskell.org/ghc/docs/papers/unboxed-values.ps.gz)
