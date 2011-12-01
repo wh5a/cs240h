@@ -2697,9 +2697,10 @@ the pain:
 cabal install ghc-core
 ~~~~
 
-Johan Tibell has a
-  [great slide deck](http://www.slideshare.net/tibbe/highperformance-haskell)
-  from a tutorial he gave last year
+Johan Tibell has
+  [great](http://www.slideshare.net/tibbe/highperformance-haskell)
+  slide
+  [decks](http://johantibell.com/files/stanford-2011/performance.html).
 
 # Parallelism
 
@@ -4264,3 +4265,7 @@ drop n t@(Text arr off len)
 * http://stackoverflow.com/questions/578063/what-is-haskells-stream-fusion
 * http://donsbot.wordpress.com/2008/06/04/haskell-as-fast-as-c-working-at-a-high-altitude-for-low-level-performance/
 * Stream Fusion: From Lists to Streams to Nothing at All. ICFP 07
+
+
+# Language extensions
+
