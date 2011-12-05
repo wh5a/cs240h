@@ -4904,5 +4904,5 @@ module Main where
 [`FlexibleContexts`]: http://www.haskell.org/ghc/docs/latest/html/users_guide/other-type-extensions.html#flexible-contexts
 [`UndecidableInstances`]: http://www.haskell.org/ghc/docs/latest/html/users_guide/type-class-extensions.html#undecidable-instances
 [`TypeOperators`]: http://www.haskell.org/ghc/docs/latest/html/users_guide/data-type-extensions.html#infix-tycons
-[[HList]]: http://homepages.cwi.nl/~ralf/HList/paper.pdf
-[[OOHaskell]]: http://homepages.cwi.nl/~ralf/OOHaskell/paper.pdf
+[HList]: http://homepages.cwi.nl/~ralf/HList/paper.pdf
+[OOHaskell]: http://homepages.cwi.nl/~ralf/OOHaskell/paper.pdf
