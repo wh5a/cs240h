@@ -5629,11 +5629,11 @@ instance Generic (T a_0 b_1) where
 [`Data`]: http://hackage.haskell.org/packages/archive/base/latest/doc/html/Data-Data.html#t:Data
 [`Control.Exception`]: http://hackage.haskell.org/packages/archive/base/latest/doc/html/Control-Exception.html
 [`DeriveDataTypeable`]: http://www.haskell.org/ghc/docs/latest/html/users_guide/deriving.html#deriving-typeable
-[[Boilerplate1]]: http://research.microsoft.com/en-us/um/people/simonpj/papers/hmap/hmap.ps
-[[Boilerplate2]]: http://research.microsoft.com/en-us/um/people/simonpj/papers/hmap/gmap2.ps
+[Boilerplate1]: http://research.microsoft.com/en-us/um/people/simonpj/papers/hmap/hmap.ps
+[Boilerplate2]: http://research.microsoft.com/en-us/um/people/simonpj/papers/hmap/gmap2.ps
 [`Typeable`]: http://hackage.haskell.org/packages/archive/base/latest/doc/html/Data-Typeable.html#t:Typeable
 [`ExistentialQuantification`]: http://www.haskell.org/ghc/docs/latest/html/users_guide/data-type-extensions.html#existential-quantification
 [`Rank2Types`]: http://www.haskell.org/ghc/docs/latest/html/users_guide/other-type-extensions.html#universal-quantification
-[[Marlow]]: http://community.haskell.org/~simonmar/papers/ext-exceptions.pdf
+[Marlow]: http://community.haskell.org/~simonmar/papers/ext-exceptions.pdf
 [`DefaultSignatures`]: http://www.haskell.org/ghc/docs/latest/html/users_guide/type-class-extensions.html#class-default-signatures
 [`DeriveGenerics`]: http://www.haskell.org/haskellwiki/Generics
